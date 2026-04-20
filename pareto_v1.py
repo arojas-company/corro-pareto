@@ -82,15 +82,29 @@ def shopify_get(endpoint, params):
     headers = {"X-Shopify-Access-Token": TOKEN}
     results = []
     while url:
-        for attempt in range(6):
-            r = requests.get(url, headers=headers, params=params, timeout=60)
+        for attempt in range(8):
+            try:
+                r = requests.get(url, headers=headers, params=params, timeout=60)
+            except requests.exceptions.ConnectionError as e:
+                wait = min(2 ** attempt, 60)
+                print(f"    connection error — retrying in {wait}s (attempt {attempt+1}/8): {e}")
+                time.sleep(wait)
+                continue
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 2 ** attempt))
                 print(f"    rate-limited — waiting {wait}s...")
                 time.sleep(wait)
                 continue
+            if r.status_code in (502, 503, 504):
+                wait = min(2 ** attempt, 60)
+                print(f"    {r.status_code} gateway error — retrying in {wait}s (attempt {attempt+1}/8)...")
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             break
+        else:
+            # All 8 attempts exhausted — raise the last response's error
+            r.raise_for_status()
         data = r.json()
         key = [k for k in data if k != "errors"][0]
         results.extend(data[key])
