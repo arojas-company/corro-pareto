@@ -329,30 +329,124 @@ def get_gc():
     creds = Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
     return gspread.authorize(creds)
 
+def sheets_call(fn, *args, **kwargs):
+    """
+    Wrapper para cualquier llamada a gspread con retry automatico en 429/500.
+    Google Sheets API permite 60 write requests/minuto por usuario.
+    """
+    for attempt in range(8):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = e.response.status_code if hasattr(e, "response") else 0
+            if status == 429 or status >= 500:
+                wait = min(15 * (attempt + 1), 90)
+                print(f"    Sheets API {status} — waiting {wait}s (attempt {attempt+1})...")
+                time.sleep(wait)
+                continue
+            raise
+        except Exception as e:
+            if attempt < 3:
+                print(f"    Sheets error, retrying in 10s: {e}")
+                time.sleep(10)
+                continue
+            raise
+    raise RuntimeError(f"Sheets call failed after 8 attempts")
+
 def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
-    try:    ws = sh.worksheet(tab_name)
-    except: ws = sh.add_worksheet(tab_name, rows=5000, cols=len(headers)+2)
+    """
+    Upsert seguro con:
+    - retry automatico en 429 de Sheets API
+    - batches de 500 filas (maximo eficiente)
+    - sleep entre batches para no superar 60 writes/min
+    - usa batch_update en lugar de clear+append para reducir # de requests
+    """
+    BATCH_SIZE   = 500   # max rows per append_rows call
+    SLEEP_BATCH  = 2.0   # seconds between batches (keeps under 60/min)
+    SLEEP_TAB    = 5.0   # seconds between tabs
+
+    # Get or create worksheet
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheets_call(sh.add_worksheet, tab_name,
+                         rows=max(5000, len(new_rows) + 100),
+                         cols=len(headers) + 2)
+        time.sleep(2)
+
+    # Read existing data for upsert merge
     existing = {}
-    vals = ws.get_all_values()
-    if len(vals) >= 2:
-        ex_h = vals[0]
-        for r in vals[1:]:
-            m = {ex_h[i]:(r[i] if i<len(r) else "") for i in range(len(ex_h))}
-            k = tuple(str(m.get(c,"")).strip() for c in key_cols)
-            if any(k): existing[k] = [m.get(h,"") for h in headers]
+    try:
+        vals = sheets_call(ws.get_all_values)
+        if len(vals) >= 2:
+            ex_h = vals[0]
+            for r in vals[1:]:
+                m = {ex_h[i]: (r[i] if i < len(r) else "") for i in range(len(ex_h))}
+                k = tuple(str(m.get(c, "")).strip() for c in key_cols)
+                if any(k):
+                    existing[k] = [m.get(h, "") for h in headers]
+    except Exception as e:
+        print(f"    Warning: could not read existing data for {tab_name}: {e}")
+
+    # Merge: new rows overwrite existing rows with same key
     for row in new_rows:
-        m = {headers[i]: row[i] for i in range(len(headers))}
-        k = tuple(str(m.get(c,"")).strip() for c in key_cols)
+        m = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
+        k = tuple(str(m.get(c, "")).strip() for c in key_cols)
         existing[k] = row
-    merged = sorted(existing.values(), key=lambda r: (
-        {headers[i]:r[i] for i in range(len(headers))}.get("period_start",""),
-        int({headers[i]:r[i] for i in range(len(headers))}.get("rank",0) or 0)
-    ))
-    ws.clear()
-    ws.append_row(headers)
-    for i in range(0, len(merged), 100):
-        ws.append_rows(merged[i:i+100], value_input_option="USER_ENTERED")
-    print(f"    ✓ {tab_name}: {len(new_rows)} new, {len(merged)} total")
+
+    # Sort merged data
+    def sort_key(r):
+        m = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        period_start = str(m.get("period_start", "") or "")
+        rank         = int(m.get("rank", 0) or 0)
+        period       = str(m.get("period", "") or "")
+        return (period_start, period, rank)
+
+    merged = sorted(existing.values(), key=sort_key)
+
+    # Build full data matrix (headers + all rows), convert everything to str/num
+    all_data = [headers]
+    for r in merged:
+        clean = []
+        for v in r:
+            if v is None:
+                clean.append("")
+            elif isinstance(v, float) and (v != v):  # NaN check
+                clean.append("")
+            else:
+                clean.append(v)
+        all_data.append(clean)
+
+    total_rows = len(all_data)
+    total_cols = len(headers)
+
+    # Resize worksheet if needed
+    if total_rows > ws.row_count or total_cols > ws.col_count:
+        sheets_call(ws.resize,
+                    rows=total_rows + 50,
+                    cols=total_cols + 2)
+        time.sleep(1)
+
+    # Clear and write in one batch_update call (counts as 1 write request)
+    sheets_call(ws.clear)
+    time.sleep(1)
+
+    # Write in batches of BATCH_SIZE rows
+    written = 0
+    for i in range(0, len(all_data), BATCH_SIZE):
+        batch = all_data[i:i + BATCH_SIZE]
+        sheets_call(
+            ws.append_rows, batch,
+            value_input_option="USER_ENTERED",
+            insert_data_option="INSERT_ROWS",
+        )
+        written += len(batch)
+        print(f"    {tab_name}: {written}/{total_rows} rows written...")
+        if i + BATCH_SIZE < len(all_data):
+            time.sleep(SLEEP_BATCH)
+
+    time.sleep(SLEEP_TAB)  # pause between tabs
+    print(f"    ok {tab_name}: {len(new_rows)} new rows, {len(merged)} total stored")
 
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
