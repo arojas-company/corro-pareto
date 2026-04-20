@@ -1,36 +1,25 @@
 """
 PARETO PIPELINE v1 — Equestrian Labs / Corro
 =============================================
-Pulls order data directly from Shopify REST API and writes
-four Pareto analysis tabs to Google Sheets:
+Writes 5 tabs to the PARETO Google Sheet (separate from dashboard sheet):
+  pareto_products   – by parent product (all variants grouped)
+  pareto_categories – by Shopify collection (main category)
+  pareto_channels   – by sales channel
+  pareto_customers  – top customers ranked
+  pareto_new_vs_ret – New vs Returning summary
 
-  pareto_products   – revenue by PARENT product (groups all variants/colors)
-  pareto_categories – revenue by Shopify collection (main category)
-  pareto_channels   – revenue by sales channel
-  pareto_customers  – top customers by revenue
-
-Each tab stores ALL periods — every full year and every quarter from
-START_YEAR through today. The dashboard filters client-side by period key.
-
-Period keys written:
-  full_year_2024, full_year_2025, full_year_2026  (Jan 1 → Dec 31 or today)
-  q1_2024 … q4_2026                               (Jan-Mar, Apr-Jun, Jul-Sep, Oct-Dec)
-
-Designed to answer Ceci's question:
-  "Why does a product with 14 sales in 90 days not appear in top sellers?"
-  → Because the old report split by variant. Now grouped by parent product.
+Concierge detection confirmed from tag audit (Q4 2025, 326 orders):
+  Tags: 'concierge, LH' | 'Concierge, DG' | 'Concierge, JS' | 'concierge, JW'
+  Both lowercase and capitalized exist → .lower() handles both correctly
 
 Run modes:
-  python pareto_v1.py                    # all periods from START_YEAR → today
-  python pareto_v1.py --only q4_2025    # single period (for quick re-run)
+  python pareto_v1.py                     # all periods 2024 → today
+  python pareto_v1.py --only q4_2025     # single quarter
+  python pareto_v1.py --only full_year_2025
   python pareto_v1.py --only custom --start 2025-01-01 --end 2025-12-31
 
-Environment variables required:
-  SHOPIFY_TOKEN_CORRO   – Shopify Admin API token
-  GOOGLE_CREDENTIALS    – Google service account JSON string
-  SHEET_ID_CORRO        – Google Sheet ID for Corro
-
-GitHub Actions: set as repository secrets.
+GitHub Actions secrets required:
+  SHOPIFY_TOKEN_CORRO   GOOGLE_CREDENTIALS   SHEET_ID_CORRO
 """
 
 import os, json, requests, gspread, argparse, calendar
@@ -39,81 +28,53 @@ from datetime import datetime, timedelta, date
 from collections import defaultdict
 import pytz
 
-# ── CONFIG ────────────────────────────────────────────────────────
 TIMEZONE    = pytz.timezone("America/Bogota")
 API_VERSION = "2024-10"
 STORE_URL   = os.environ.get("SHOPIFY_STORE", "equestrian-labs.myshopify.com")
 TOKEN       = os.environ.get("SHOPIFY_TOKEN_CORRO", "")
-SHEET_ID    = os.environ.get("SHEET_ID_CORRO", "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU")
+SHEET_ID    = os.environ.get("SHEET_ID_CORRO",
+              "1NnH7Ln3HP9AuJ5ohxgvVk6A5BnG9_iz9WPC9SxaaidI")
 SCOPES      = ["https://www.googleapis.com/auth/spreadsheets",
                "https://www.googleapis.com/auth/drive"]
-
-# First year to include in full backfill
 START_YEAR  = 2024
 
-# Channel detection — same logic as pipeline_v3
-CHANNEL_MAP = {
-    "pos":          "Wellington (POS)",
-    "wellington":   "Wellington (POS)",
-    "concierge":    "Concierge",
-    "web":          "Online (Ecom)",
-    "shopify":      "Online (Ecom)",
-    "online_store": "Online (Ecom)",
-    "":             "Online (Ecom)",
-}
-
-# ── PERIOD BUILDER ────────────────────────────────────────────────
+# ── PERIODS ───────────────────────────────────────────────────────
 def last_day(y, m):
     return date(y, m, calendar.monthrange(y, m)[1])
 
 def build_all_periods():
-    """
-    Returns list of (start, end, period_key) for:
-      - Every full year from START_YEAR to current year
-      - Every quarter from Q1 START_YEAR to the current (partial) quarter
-    Sorted chronologically, most recent first.
-    """
     today = datetime.now(TIMEZONE).date()
     periods = []
-
     for y in range(START_YEAR, today.year + 1):
-        # Full year
         ys = date(y, 1, 1)
         ye = date(y, 12, 31) if y < today.year else today
         periods.append((ys, ye, f"full_year_{y}"))
-
-        # Quarters
         max_q = 4 if y < today.year else ((today.month - 1) // 3 + 1)
         for q in range(1, max_q + 1):
             qs = date(y, (q - 1) * 3 + 1, 1)
             qe = last_day(y, q * 3) if (y < today.year or q < max_q) else today
             periods.append((qs, qe, f"q{q}_{y}"))
-
-    # Most recent first so progress output is intuitive
     periods.sort(key=lambda x: x[0], reverse=True)
     return periods
 
 def resolve_single(key, start_override=None, end_override=None):
-    """Parse a single --only period key into (start, end, key)."""
     today = datetime.now(TIMEZONE).date()
     if key == "custom" and start_override and end_override:
         return date.fromisoformat(start_override), date.fromisoformat(end_override), "custom"
-    # full_year_YYYY or full_year (current year)
     if key.startswith("full_year_"):
         y = int(key.split("_")[-1])
         return date(y, 1, 1), (date(y, 12, 31) if y < today.year else today), key
     if key == "full_year":
         return date(today.year, 1, 1), today, f"full_year_{today.year}"
-    # qN_YYYY
     if key.startswith("q") and "_" in key:
         parts = key[1:].split("_"); q, y = int(parts[0]), int(parts[1])
         qs = date(y, (q - 1) * 3 + 1, 1)
         cur_q = (today.month - 1) // 3 + 1
         qe = last_day(y, q * 3) if (y < today.year or q < cur_q) else today
         return qs, qe, key
-    raise ValueError(f"Unknown period key: {key}. Use full_year_YYYY or qN_YYYY or custom.")
+    raise ValueError(f"Unknown period: {key}. Use full_year_YYYY, qN_YYYY, or custom.")
 
-# ── SHOPIFY REST ───────────────────────────────────────────────────
+# ── SHOPIFY REST ──────────────────────────────────────────────────
 def shopify_get(endpoint, params):
     url = f"https://{STORE_URL}/admin/api/{API_VERSION}/{endpoint}"
     headers = {"X-Shopify-Access-Token": TOKEN}
@@ -131,8 +92,7 @@ def shopify_get(endpoint, params):
                     url = part.split(";")[0].strip().strip("<>")
     return results
 
-def fetch_orders(start: date, end: date):
-    """Fetch all paid orders in date range with full line item detail."""
+def fetch_orders(start, end):
     print(f"  Fetching orders {start} → {end}...")
     orders = shopify_get("orders.json", {
         "status": "any",
@@ -140,196 +100,110 @@ def fetch_orders(start: date, end: date):
         "created_at_min": f"{start}T00:00:00-05:00",
         "created_at_max": f"{end}T23:59:59-05:00",
         "limit": 250,
-        "fields": (
-            "id,name,created_at,subtotal_price,total_discounts,"
-            "source_name,tags,line_items,customer"
-        ),
+        "fields": "id,name,created_at,subtotal_price,total_discounts,source_name,tags,line_items,customer",
     })
-    print(f"  → {len(orders)} orders retrieved")
+    print(f"  → {len(orders)} orders")
     return orders
 
-def fetch_cogs_map():
-    """
-    Fetch cost per variant via inventory_items API.
-    Shopify stores 'Cost per item' (COGS) in inventory_item.cost.
-    Returns: {inventory_item_id: cost_float}
-    Called in batches of 100 IDs (API limit).
-    """
-    print("  Fetching COGS from inventory items...")
-    # First get all inventory_item_ids from variants
-    all_items = shopify_get("variants.json", {
-        "limit": 250,
-        "fields": "id,inventory_item_id,sku",
-    })
-    iids = [str(v["inventory_item_id"]) for v in all_items if v.get("inventory_item_id")]
-    vid_to_iid = {str(v["id"]): str(v["inventory_item_id"]) for v in all_items if v.get("inventory_item_id")}
-
-    cost_map = {}  # inventory_item_id → cost
-    # Fetch in batches of 100
-    for i in range(0, len(iids), 100):
-        batch = iids[i:i+100]
-        items = shopify_get("inventory_items.json", {
-            "ids": ",".join(batch),
-            "limit": 100,
-            "fields": "id,cost,sku",
-        })
-        for item in items:
-            cost_map[str(item["id"])] = float(item.get("cost") or 0)
-
-    # Map variant_id → cost
-    variant_cost = {}
-    for v in all_items:
-        vid  = str(v["id"])
-        iid  = str(v.get("inventory_item_id", ""))
-        variant_cost[vid] = cost_map.get(iid, 0.0)
-
-    filled = sum(1 for c in variant_cost.values() if c > 0)
-    print(f"  → {len(variant_cost)} variants, {filled} with cost > 0")
-    return variant_cost
-
 def fetch_products_map():
-    """
-    Build a map: variant_id → {product_id, product_title, sku, vendor, product_type}
-    Used to group variants under their parent product.
-    """
     print("  Fetching product catalogue...")
-    products = shopify_get("products.json", {
-        "limit": 250,
-        "fields": "id,title,vendor,product_type,variants",
-    })
+    products = shopify_get("products.json", {"limit": 250, "fields": "id,title,vendor,product_type,variants"})
     vmap = {}
     for p in products:
         for v in p.get("variants", []):
             vmap[str(v["id"])] = {
-                "product_id":         str(p["id"]),
-                "product_title":      p.get("title", ""),
-                "sku_parent":         v.get("sku", "").split("-")[0] if v.get("sku") else "",
-                "sku_full":           v.get("sku", ""),
-                "vendor":             p.get("vendor", ""),
-                "product_type":       p.get("product_type", "Uncategorized"),
-                "inventory_item_id":  str(v.get("inventory_item_id", "")),
+                "product_id":        str(p["id"]),
+                "product_title":     p.get("title", ""),
+                "sku_parent":        v.get("sku", "").split("-")[0] if v.get("sku") else "",
+                "vendor":            p.get("vendor", ""),
+                "product_type":      p.get("product_type", "Uncategorized"),
+                "inventory_item_id": str(v.get("inventory_item_id", "")),
             }
-    print(f"  → {len(products)} products / {len(vmap)} variants mapped")
+    print(f"  → {len(products)} products / {len(vmap)} variants")
     return vmap
 
-def fetch_collections_map():
-    """
-    Build a map: product_id → [collection_title, ...]
-    Uses Shopify GraphQL Admin API (collects.json was deprecated).
-    First fetches all collection IDs+titles via REST, then fetches
-    products per collection via GraphQL using the collection GID.
-    """
-    print("  Fetching collections via GraphQL...")
-    url_gql = f"https://{STORE_URL}/admin/api/{API_VERSION}/graphql.json"
-    headers = {
-        "X-Shopify-Access-Token": TOKEN,
-        "Content-Type": "application/json",
-    }
+def fetch_cogs_map():
+    print("  Fetching COGS from inventory items...")
+    all_variants = shopify_get("variants.json", {"limit": 250, "fields": "id,inventory_item_id"})
+    iids = [str(v["inventory_item_id"]) for v in all_variants if v.get("inventory_item_id")]
+    cost_map = {}
+    for i in range(0, len(iids), 100):
+        items = shopify_get("inventory_items.json", {
+            "ids": ",".join(iids[i:i+100]), "limit": 100, "fields": "id,cost"
+        })
+        for item in items:
+            cost_map[str(item["id"])] = float(item.get("cost") or 0)
+    variant_cost = {}
+    for v in all_variants:
+        variant_cost[str(v["id"])] = cost_map.get(str(v.get("inventory_item_id", "")), 0.0)
+    filled = sum(1 for c in variant_cost.values() if c > 0)
+    print(f"  → {len(variant_cost)} variants, {filled} with COGS > 0")
+    return variant_cost
 
-    # Step 1: get all collections (id + title) via REST — still works
+def fetch_collections_map():
+    print("  Fetching collections...")
     colls = {}
     for c in shopify_get("custom_collections.json", {"limit": 250, "fields": "id,title"}):
         colls[str(c["id"])] = c["title"]
     for c in shopify_get("smart_collections.json", {"limit": 250, "fields": "id,title"}):
         colls[str(c["id"])] = c["title"]
-
-    # Step 2: for each collection, fetch its products via GraphQL (handles pagination)
-    prod_collections = defaultdict(list)
+    prod_colls = defaultdict(list)
     for cid, ctitle in colls.items():
-        gid = f"gid://shopify/Collection/{cid}"
-        prod_cursor = None
-        while True:
-            after = f', after: "{prod_cursor}"' if prod_cursor else ""
-            query = f"""
-            {{
-              collection(id: "{gid}") {{
-                products(first: 250{after}) {{
-                  pageInfo {{ hasNextPage endCursor }}
-                  edges {{ node {{ id }} }}
-                }}
-              }}
-            }}
-            """
-            r = requests.post(url_gql, headers=headers, json={"query": query}, timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            coll_node = (data.get("data") or {}).get("collection")
-            if not coll_node:
-                break
-            products_page = coll_node["products"]
-            for pe in products_page["edges"]:
-                pid = pe["node"]["id"].split("/")[-1]
-                prod_collections[pid].append(ctitle)
-            if not products_page["pageInfo"]["hasNextPage"]:
-                break
-            prod_cursor = products_page["pageInfo"]["endCursor"]
+        for co in shopify_get("collects.json", {"collection_id": cid, "limit": 250, "fields": "product_id"}):
+            prod_colls[str(co["product_id"])].append(ctitle)
+    print(f"  → {len(colls)} collections")
+    return prod_colls
 
-    print(f"  → {len(colls)} collections mapped")
-    return prod_collections
-
-# ── ANALYSIS ──────────────────────────────────────────────────────
+# ── CHANNEL DETECTION ─────────────────────────────────────────────
+# Confirmed tags from Q4 2025 audit (326 concierge orders):
+#   'concierge, EliteCartGift, LH' | 'Concierge, DG' | 'Concierge, JS'
+#   'concierge, LH' | 'Concierge, JW' | 'concierge, JW' (via draft order)
+# Both "concierge" and "Concierge" → .lower() handles both
 def detect_channel(order):
     src  = (order.get("source_name") or "").lower().strip()
     tags = (order.get("tags") or "").lower()
-    if src == "pos" or "wellington" in tags or "pos" in tags:
-        return "Wellington (POS)"
     if "concierge" in tags or "concierge" in src:
         return "Concierge"
-    if src in ("web", "shopify", "", "online_store") or not src:
-        return "Online (Ecom)"
-    return "Others"
+    if src == "pos" or "wellington" in tags:
+        return "Wellington (POS)"
+    return "Online (Ecom)"
 
 def audit_concierge_tags(orders, sample=30):
-    """
-    Print every unique tag combination found in orders.
-    Use this to discover the exact tag Shopify is using for Concierge orders.
-    Run once and check the output to confirm.
-    """
     tag_counts = defaultdict(int)
-    concierge_found = []
+    concierge_count = 0
     for o in orders:
         tags = (o.get("tags") or "").strip()
         src  = (o.get("source_name") or "").strip()
-        key  = f"source={src!r:20} | tags={tags[:80]!r}" if tags or src else "(no tags, no source)"
+        key  = f"source={src!r:20} | tags={tags[:80]!r}" if (tags or src) else "(no tags)"
         tag_counts[key] += 1
         if "concierge" in tags.lower() or "concierge" in src.lower():
-            concierge_found.append(key)
-
+            concierge_count += 1
     print("\n  ── CONCIERGE TAG AUDIT ──────────────────────────────")
-    print(f"  Total unique source+tag combos: {len(tag_counts)}")
-    print(f"  Orders matching 'concierge': {len(concierge_found)}")
-    print("\n  All source+tag combinations (sorted by count):")
+    print(f"  Orders matching 'concierge': {concierge_count} / {len(orders)}")
     for k, cnt in sorted(tag_counts.items(), key=lambda x: -x[1])[:sample]:
         print(f"    {cnt:>5}x  {k}")
     print("  ────────────────────────────────────────────────────\n")
 
+# ── AGGREGATION ───────────────────────────────────────────────────
 def build_pareto_products(orders, vmap, variant_cost):
-    """Group by parent product, summing revenue + COGS + gross profit."""
     agg = defaultdict(lambda: {
-        "product_id": "", "product_title": "", "product_type": "",
-        "vendor": "", "sku_parent": "",
-        "gross_sales": 0.0, "discounts": 0.0, "net_sales": 0.0,
-        "cogs": 0.0, "gross_profit": 0.0,
-        "units": 0, "orders": set(), "channels": defaultdict(float),
+        "product_id":"","product_title":"","product_type":"","vendor":"","sku_parent":"",
+        "gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,
+        "units":0,"orders":set(),"channels":defaultdict(float),
     })
     for order in orders:
-        disc_total  = float(order.get("total_discounts", 0) or 0)
-        li_count    = len(order.get("line_items", [])) or 1
+        disc_total  = float(order.get("total_discounts",0) or 0)
+        li_count    = len(order.get("line_items",[])) or 1
         disc_per_li = disc_total / li_count
-        for li in order.get("line_items", []):
+        for li in order.get("line_items",[]):
             vid   = str(li.get("variant_id") or "")
-            info  = vmap.get(vid, {
-                "product_id": str(li.get("product_id", "")),
-                "product_title": li.get("title", "Unknown"),
-                "product_type": "Uncategorized",
-                "vendor": "", "sku_parent": "",
-            })
+            info  = vmap.get(vid,{"product_id":str(li.get("product_id","")),"product_title":li.get("title","Unknown"),"product_type":"Uncategorized","vendor":"","sku_parent":""})
             pid   = info["product_id"]
-            qty   = int(li.get("quantity", 0) or 0)
-            price = float(li.get("price", 0) or 0) * qty
+            qty   = int(li.get("quantity",0) or 0)
+            price = float(li.get("price",0) or 0) * qty
             net   = max(price - disc_per_li, 0)
             cost  = variant_cost.get(vid, 0.0) * qty
-            row = agg[pid]
+            row   = agg[pid]
             row["product_id"]    = pid
             row["product_title"] = info["product_title"]
             row["product_type"]  = info["product_type"]
@@ -346,24 +220,19 @@ def build_pareto_products(orders, vmap, variant_cost):
     return agg
 
 def build_pareto_categories(orders, vmap, prod_colls, variant_cost):
-    """Group by main Shopify collection/product_type, including COGS."""
-    agg = defaultdict(lambda: {
-        "gross_sales": 0.0, "discounts": 0.0, "net_sales": 0.0,
-        "cogs": 0.0, "gross_profit": 0.0,
-        "units": 0, "orders": set(),
-    })
+    agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,"units":0,"orders":set()})
     for order in orders:
-        disc_total  = float(order.get("total_discounts", 0) or 0)
-        li_count    = len(order.get("line_items", [])) or 1
+        disc_total  = float(order.get("total_discounts",0) or 0)
+        li_count    = len(order.get("line_items",[])) or 1
         disc_per_li = disc_total / li_count
-        for li in order.get("line_items", []):
+        for li in order.get("line_items",[]):
             vid   = str(li.get("variant_id") or "")
-            info  = vmap.get(vid, {"product_id": "", "product_type": "Uncategorized"})
+            info  = vmap.get(vid,{"product_id":"","product_type":"Uncategorized"})
             pid   = info["product_id"]
-            cats  = prod_colls.get(pid, [])
+            cats  = prod_colls.get(pid,[])
             cat   = cats[0] if cats else (info.get("product_type") or "Uncategorized")
-            qty   = int(li.get("quantity", 0) or 0)
-            price = float(li.get("price", 0) or 0) * qty
+            qty   = int(li.get("quantity",0) or 0)
+            price = float(li.get("price",0) or 0) * qty
             net   = max(price - disc_per_li, 0)
             cost  = variant_cost.get(vid, 0.0) * qty
             agg[cat]["gross_sales"]  += price
@@ -376,16 +245,12 @@ def build_pareto_categories(orders, vmap, prod_colls, variant_cost):
     return agg
 
 def build_pareto_channels(orders):
-    """Group by sales channel."""
-    agg = defaultdict(lambda: {
-        "gross_sales": 0.0, "discounts": 0.0, "net_sales": 0.0,
-        "units": 0, "orders": set(),
-    })
+    agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"units":0,"orders":set()})
     for order in orders:
-        ch    = detect_channel(order)
-        disc  = float(order.get("total_discounts", 0) or 0)
-        sub   = float(order.get("subtotal_price", 0) or 0)
-        units = sum(int(li.get("quantity", 0) or 0) for li in order.get("line_items", []))
+        ch   = detect_channel(order)
+        disc = float(order.get("total_discounts",0) or 0)
+        sub  = float(order.get("subtotal_price",0) or 0)
+        units = sum(int(li.get("quantity",0) or 0) for li in order.get("line_items",[]))
         agg[ch]["gross_sales"] += sub + disc
         agg[ch]["discounts"]   += disc
         agg[ch]["net_sales"]   += sub
@@ -394,34 +259,19 @@ def build_pareto_channels(orders):
     return agg
 
 def build_pareto_customers(orders, period_start):
-    """
-    Top customers by net sales.
-    Classifies each customer as NEW (first ever order within this period)
-    or RETURNING (had orders before period_start).
-    Also builds a new_vs_returning summary.
-    """
-    agg = defaultdict(lambda: {
-        "customer_id": "", "name": "", "email": "",
-        "gross_sales": 0.0, "net_sales": 0.0, "orders": 0, "units": 0,
-        "first_order": "9999-99-99", "last_order": "0000-00-00",
-        "is_new": True,
-    })
+    agg = defaultdict(lambda: {"customer_id":"","name":"","email":"","gross_sales":0.0,"net_sales":0.0,"orders":0,"units":0,"first_order":"9999-99-99","last_order":"0000-00-00","is_new":True})
     for order in orders:
         c    = order.get("customer") or {}
         cid  = str(c.get("id", f"guest_{order['id']}"))
-        fn   = c.get("first_name", ""); ln = c.get("last_name", "")
-        sub  = float(order.get("subtotal_price", 0) or 0)
-        disc = float(order.get("total_discounts", 0) or 0)
-        units = sum(int(li.get("quantity", 0) or 0) for li in order.get("line_items", []))
-        d    = order.get("created_at", "")[:10]
-        # Customer is NEW if their Shopify account was created on/after period_start
-        cust_created = (c.get("created_at") or d)[:10]
-        is_new = cust_created >= str(period_start)
-
-        row = agg[cid]
+        sub  = float(order.get("subtotal_price",0) or 0)
+        disc = float(order.get("total_discounts",0) or 0)
+        units = sum(int(li.get("quantity",0) or 0) for li in order.get("line_items",[]))
+        d    = order.get("created_at","")[:10]
+        is_new = (c.get("created_at") or d)[:10] >= str(period_start)
+        row  = agg[cid]
         row["customer_id"]  = cid
-        row["name"]         = f"{fn} {ln}".strip() or "Guest"
-        row["email"]        = c.get("email", "")
+        row["name"]         = f"{c.get('first_name','')} {c.get('last_name','')}".strip() or "Guest"
+        row["email"]        = c.get("email","")
         row["gross_sales"] += sub + disc
         row["net_sales"]   += sub
         row["orders"]      += 1
@@ -431,119 +281,75 @@ def build_pareto_customers(orders, period_start):
         if d > row["last_order"]:  row["last_order"]  = d
     return agg
 
-def build_new_vs_returning(agg_customers):
-    """
-    Returns a simple summary dict:
-      {new: {count, revenue, orders}, returning: {count, revenue, orders}}
-    This is the table the meeting asked for.
-    """
-    summary = {
-        "new":       {"count": 0, "net_sales": 0.0, "orders": 0},
-        "returning": {"count": 0, "net_sales": 0.0, "orders": 0},
-    }
-    for d in agg_customers.values():
-        key = "new" if d["is_new"] else "returning"
-        summary[key]["count"]     += 1
-        summary[key]["net_sales"] += d["net_sales"]
-        summary[key]["orders"]    += d["orders"]
-    return summary
+def build_new_vs_returning(agg_cust):
+    s = {"new":{"count":0,"net_sales":0.0,"orders":0},"returning":{"count":0,"net_sales":0.0,"orders":0}}
+    for d in agg_cust.values():
+        k = "new" if d["is_new"] else "returning"
+        s[k]["count"] += 1; s[k]["net_sales"] += d["net_sales"]; s[k]["orders"] += d["orders"]
+    return s
 
-# ── PARETO MATH ───────────────────────────────────────────────────
-def add_pareto_cols(rows_sorted, revenue_key="net_sales"):
-    """Add cumulative % and pareto zone (A/B/C) columns."""
-    total = sum(r[revenue_key] for r in rows_sorted)
+def add_pareto_cols(rows, revenue_key="net_sales"):
+    total = sum(r[revenue_key] for r in rows)
     cum = 0.0
-    for i, r in enumerate(rows_sorted):
+    for i, r in enumerate(rows):
         cum += r[revenue_key]
         r["rank"]        = i + 1
-        r["pct_revenue"] = round(r[revenue_key] / total * 100, 2) if total else 0
-        r["cum_pct"]     = round(cum / total * 100, 2) if total else 0
-        r["pareto_zone"] = "A" if r["cum_pct"] <= 80 else ("B" if r["cum_pct"] <= 95 else "C")
-    return rows_sorted, total
+        r["pct_revenue"] = round(r[revenue_key]/total*100,2) if total else 0
+        r["cum_pct"]     = round(cum/total*100,2) if total else 0
+        r["pareto_zone"] = "A" if r["cum_pct"]<=80 else ("B" if r["cum_pct"]<=95 else "C")
+    return rows, total
 
-# ── GOOGLE SHEETS WRITER ──────────────────────────────────────────
+# ── SHEETS ────────────────────────────────────────────────────────
 def get_gc():
-    creds = Credentials.from_service_account_info(
-        json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
+    creds = Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
     return gspread.authorize(creds)
 
-# ── UPSERT WRITER (keeps all periods, updates existing ones) ──────
 def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
-    """
-    Reads existing tab, merges new_rows by composite key (key_cols),
-    then rewrites the full tab. Preserves historical periods.
-    """
     try:    ws = sh.worksheet(tab_name)
     except: ws = sh.add_worksheet(tab_name, rows=5000, cols=len(headers)+2)
-
-    existing_vals = ws.get_all_values()
     existing = {}
-    if len(existing_vals) >= 2:
-        ex_h = existing_vals[0]
-        for r in existing_vals[1:]:
-            m = {ex_h[i]: (r[i] if i < len(r) else "") for i in range(len(ex_h))}
+    vals = ws.get_all_values()
+    if len(vals) >= 2:
+        ex_h = vals[0]
+        for r in vals[1:]:
+            m = {ex_h[i]:(r[i] if i<len(r) else "") for i in range(len(ex_h))}
             k = tuple(str(m.get(c,"")).strip() for c in key_cols)
             if any(k): existing[k] = [m.get(h,"") for h in headers]
-
     for row in new_rows:
-        # row is a list aligned to headers
         m = {headers[i]: row[i] for i in range(len(headers))}
         k = tuple(str(m.get(c,"")).strip() for c in key_cols)
         existing[k] = row
-
-    merged = list(existing.values())
-    # Sort by period_start desc, then rank asc
-    def sort_key(r):
-        m = {headers[i]: r[i] for i in range(len(headers))}
-        return (str(m.get("period_start","")) or "0000", int(m.get("rank",0) or 0))
-    merged.sort(key=sort_key, reverse=False)
-    merged.sort(key=lambda r: {headers[i]: r[i] for i in range(len(headers))}.get("period_start",""), reverse=True)
-
+    merged = sorted(existing.values(), key=lambda r: (
+        {headers[i]:r[i] for i in range(len(headers))}.get("period_start",""),
+        int({headers[i]:r[i] for i in range(len(headers))}.get("rank",0) or 0)
+    ))
     ws.clear()
     ws.append_row(headers)
-    if merged:
-        # Write in batches to avoid timeout
-        for i in range(0, len(merged), 100):
-            ws.append_rows(merged[i:i+100], value_input_option="USER_ENTERED")
-    print(f"    ✓ {tab_name}: {len(new_rows)} new rows, {len(merged)} total stored")
-    return ws
-
+    for i in range(0, len(merged), 100):
+        ws.append_rows(merged[i:i+100], value_input_option="USER_ENTERED")
+    print(f"    ✓ {tab_name}: {len(new_rows)} new, {len(merged)} total")
 
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--only", default=None,
-        help="Run a single period key, e.g. q4_2025 or full_year_2025 or custom")
-    parser.add_argument("--start", help="Start date YYYY-MM-DD (with --only custom)")
-    parser.add_argument("--end",   help="End date YYYY-MM-DD (with --only custom)")
+    parser.add_argument("--only", default=None)
+    parser.add_argument("--start"); parser.add_argument("--end")
     args = parser.parse_args()
 
-    today   = datetime.now(TIMEZONE).date()
     now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
-
-    # Decide which periods to run
-    if args.only:
-        periods = [resolve_single(args.only, args.start, args.end)]
-        mode = f"single ({args.only})"
-    else:
-        periods = build_all_periods()
-        mode = f"full backfill — {len(periods)} periods"
+    periods = [resolve_single(args.only, args.start, args.end)] if args.only else build_all_periods()
 
     print(f"\n{'='*60}")
     print(f"  PARETO PIPELINE — Corro ({STORE_URL})")
-    print(f"  Mode: {mode}")
+    print(f"  Mode  : {'single ('+args.only+')' if args.only else 'full backfill — '+str(len(periods))+' periods'}")
+    print(f"  Sheet : {SHEET_ID}")
     print(f"{'='*60}\n")
 
-    # Fetch catalogue once — reused across all periods
     vmap         = fetch_products_map()
     variant_cost = fetch_cogs_map()
     prod_colls   = fetch_collections_map()
+    sh           = get_gc().open_by_key(SHEET_ID)
 
-    # Open sheet once
-    gc = get_gc()
-    sh = gc.open_by_key(SHEET_ID)
-
-    # Headers for each tab
     h_prod = ["updated_at","period","period_start","period_end","rank","pareto_zone",
               "product_title","product_type","vendor","sku_parent","product_id",
               "gross_sales","discounts","net_sales","cogs","gross_profit",
@@ -552,8 +358,7 @@ def main():
               "category","gross_sales","discounts","net_sales","cogs","gross_profit",
               "gp_pct","pct_revenue","cum_pct","units","orders"]
     h_ch   = ["updated_at","period","period_start","period_end","rank","pareto_zone",
-              "channel","gross_sales","discounts","net_sales","pct_revenue","cum_pct",
-              "units","orders"]
+              "channel","gross_sales","discounts","net_sales","pct_revenue","cum_pct","units","orders"]
     h_cust = ["updated_at","period","period_start","period_end","rank","pareto_zone",
               "customer_id","name","email","segment","net_sales","pct_revenue","cum_pct",
               "orders","units","first_order","last_order"]
@@ -561,121 +366,90 @@ def main():
               "segment","customers","net_sales","orders","pct_customers","pct_revenue"]
 
     all_prod, all_cat, all_ch, all_cust, all_nvr = [], [], [], [], []
-
-    # Run audit on first period only to discover concierge tags
     first_run = True
 
-    for idx, (start, end, period_label) in enumerate(periods):
-        print(f"\n[{idx+1}/{len(periods)}] {period_label}  ({start} → {end})")
-
+    for idx, (start, end, pk) in enumerate(periods):
+        print(f"\n[{idx+1}/{len(periods)}] {pk}  ({start} → {end})")
         orders = fetch_orders(start, end)
         if not orders:
-            print(f"  ⚠ No orders — skipping")
-            continue
+            print("  ⚠ No orders — skipping"); continue
 
-        # Print concierge tag audit on first run so you can verify the tags
         if first_run:
             audit_concierge_tags(orders)
             first_run = False
 
-        agg_products   = build_pareto_products(orders, vmap, variant_cost)
-        agg_categories = build_pareto_categories(orders, vmap, prod_colls, variant_cost)
-        agg_channels   = build_pareto_channels(orders)
-        agg_customers  = build_pareto_customers(orders, start)
-        nvr_summary    = build_new_vs_returning(agg_customers)
+        ap = build_pareto_products(orders, vmap, variant_cost)
+        ac = build_pareto_categories(orders, vmap, prod_colls, variant_cost)
+        ah = build_pareto_channels(orders)
+        au = build_pareto_customers(orders, start)
+        nvr = build_new_vs_returning(au)
 
         # Products
-        rows_raw = []
-        for pid, d in agg_products.items():
-            gp_pct = round(d["gross_profit"] / d["net_sales"] * 100, 1) if d["net_sales"] else 0
-            rows_raw.append({
-                "net_sales": d["net_sales"], "gross_sales": d["gross_sales"],
-                "discounts": d["discounts"], "units": d["units"],
-                "orders": len(d["orders"]), "product_id": d["product_id"],
-                "product_title": d["product_title"], "product_type": d["product_type"],
-                "vendor": d["vendor"], "sku_parent": d["sku_parent"],
-                "cogs": d["cogs"], "gross_profit": d["gross_profit"], "gp_pct": gp_pct,
-                "top_channel": max(d["channels"], key=d["channels"].get) if d["channels"] else "",
-            })
-        rows_sorted, _ = add_pareto_cols(sorted(rows_raw, key=lambda x: x["net_sales"], reverse=True))
-        all_prod += [[now_str, period_label, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["product_title"], r["product_type"],
-            r["vendor"], r["sku_parent"], r["product_id"],
-            round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
-            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"],
-            r["pct_revenue"], r["cum_pct"], r["units"], r["orders"], r["top_channel"],
-        ] for r in rows_sorted]
+        raws = []
+        for pid, d in ap.items():
+            gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
+            raws.append({"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],"discounts":d["discounts"],
+                "units":d["units"],"orders":len(d["orders"]),"product_id":pid,
+                "product_title":d["product_title"],"product_type":d["product_type"],
+                "vendor":d["vendor"],"sku_parent":d["sku_parent"],
+                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp,
+                "top_channel":max(d["channels"],key=d["channels"].get) if d["channels"] else ""})
+        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
+        all_prod += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
+            r["product_title"],r["product_type"],r["vendor"],r["sku_parent"],r["product_id"],
+            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
+            round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],
+            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"],r["top_channel"]] for r in rs]
 
         # Categories
-        rows_raw = []
-        for cat, d in agg_categories.items():
-            gp_pct = round(d["gross_profit"] / d["net_sales"] * 100, 1) if d["net_sales"] else 0
-            rows_raw.append({
-                "category": cat, "net_sales": d["net_sales"], "gross_sales": d["gross_sales"],
-                "discounts": d["discounts"], "units": d["units"], "orders": len(d["orders"]),
-                "cogs": d["cogs"], "gross_profit": d["gross_profit"], "gp_pct": gp_pct,
-            })
-        rows_sorted, _ = add_pareto_cols(sorted(rows_raw, key=lambda x: x["net_sales"], reverse=True))
-        all_cat += [[now_str, period_label, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["category"],
-            round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
-            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"],
-            r["pct_revenue"], r["cum_pct"], r["units"], r["orders"],
-        ] for r in rows_sorted]
+        raws = []
+        for cat, d in ac.items():
+            gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
+            raws.append({"category":cat,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
+                "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"]),
+                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp})
+        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
+        all_cat += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["category"],
+            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
+            round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],
+            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
 
         # Channels
-        rows_raw = [{"channel": ch, "net_sales": d["net_sales"], "gross_sales": d["gross_sales"],
-                     "discounts": d["discounts"], "units": d["units"], "orders": len(d["orders"])}
-                    for ch, d in agg_channels.items()]
-        rows_sorted, _ = add_pareto_cols(sorted(rows_raw, key=lambda x: x["net_sales"], reverse=True))
-        all_ch += [[now_str, period_label, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["channel"],
-            round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
-            r["pct_revenue"], r["cum_pct"], r["units"], r["orders"],
-        ] for r in rows_sorted]
+        raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
+                 "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
+        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
+        all_ch += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["channel"],
+            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
+            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
 
         # Customers
-        rows_raw = [dict(d, net_sales=d["net_sales"], segment="New" if d["is_new"] else "Returning")
-                    for d in agg_customers.values()]
-        rows_sorted, _ = add_pareto_cols(sorted(rows_raw, key=lambda x: x["net_sales"], reverse=True))
-        all_cust += [[now_str, period_label, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["customer_id"], r["name"], r["email"],
-            r["segment"], round(r["net_sales"],2), r["pct_revenue"], r["cum_pct"],
-            r["orders"], r["units"], r["first_order"], r["last_order"],
-        ] for r in rows_sorted]
+        raws = [dict(d,segment="New" if d["is_new"] else "Returning") for d in au.values()]
+        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
+        all_cust += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
+            r["customer_id"],r["name"],r["email"],r["segment"],
+            round(r["net_sales"],2),r["pct_revenue"],r["cum_pct"],
+            r["orders"],r["units"],r["first_order"],r["last_order"]] for r in rs]
 
-        # New vs Returning summary — the simple table the meeting asked for
-        total_cust = sum(v["count"] for v in nvr_summary.values()) or 1
-        total_rev  = sum(v["net_sales"] for v in nvr_summary.values()) or 1
-        for seg, v in nvr_summary.items():
-            all_nvr.append([
-                now_str, period_label, str(start), str(end),
-                seg.capitalize(),
-                v["count"], round(v["net_sales"],2), v["orders"],
-                round(v["count"]/total_cust*100,1),
-                round(v["net_sales"]/total_rev*100,1),
-            ])
+        # New vs Returning
+        tc = sum(v["count"] for v in nvr.values()) or 1
+        tr = sum(v["net_sales"] for v in nvr.values()) or 1
+        for seg, v in nvr.items():
+            all_nvr.append([now_str,pk,str(start),str(end),seg.capitalize(),
+                v["count"],round(v["net_sales"],2),v["orders"],
+                round(v["count"]/tc*100,1),round(v["net_sales"]/tr*100,1)])
 
-        print(f"  → {len(orders)} orders | "
-              f"New: {nvr_summary['new']['count']} cust ${nvr_summary['new']['net_sales']:,.0f} | "
-              f"Returning: {nvr_summary['returning']['count']} cust ${nvr_summary['returning']['net_sales']:,.0f}")
+        print(f"  → {len(orders)} orders | New: {nvr['new']['count']} (${nvr['new']['net_sales']:,.0f}) | Returning: {nvr['returning']['count']} (${nvr['returning']['net_sales']:,.0f})")
 
-    # Write all to Sheets
     print(f"\n  Writing to Google Sheets...")
-    upsert_tab(sh, "pareto_products",    h_prod, all_prod, ["period","product_id"])
-    upsert_tab(sh, "pareto_categories",  h_cat,  all_cat,  ["period","category"])
-    upsert_tab(sh, "pareto_channels",    h_ch,   all_ch,   ["period","channel"])
-    upsert_tab(sh, "pareto_customers",   h_cust, all_cust, ["period","customer_id"])
-    upsert_tab(sh, "pareto_new_vs_ret",  h_nvr,  all_nvr,  ["period","segment"])
+    upsert_tab(sh,"pareto_products",  h_prod,all_prod,["period","product_id"])
+    upsert_tab(sh,"pareto_categories",h_cat, all_cat, ["period","category"])
+    upsert_tab(sh,"pareto_channels",  h_ch,  all_ch,  ["period","channel"])
+    upsert_tab(sh,"pareto_customers", h_cust,all_cust,["period","customer_id"])
+    upsert_tab(sh,"pareto_new_vs_ret",h_nvr, all_nvr, ["period","segment"])
 
     print(f"\n{'='*60}")
-    print(f"  ✓ Done — {len(periods)} periods processed")
-    print(f"  Sheets: pareto_products (+ COGS + gross_profit),")
-    print(f"          pareto_categories (+ COGS + gross_profit),")
-    print(f"          pareto_channels, pareto_customers (+ segment),")
-    print(f"          pareto_new_vs_ret (New vs Returning summary)")
+    print(f"  ✓ Done — {len(periods)} periods | Sheet: {SHEET_ID}")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     main()
-
