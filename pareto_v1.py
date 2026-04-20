@@ -302,13 +302,6 @@ def audit_concierge_tags(orders, sample=30):
     for k, cnt in sorted(tag_counts.items(), key=lambda x: -x[1])[:sample]:
         print(f"    {cnt:>5}x  {k}")
     print("  ────────────────────────────────────────────────────\n")
-    cid = (order.get("customer") or {}).get("id")
-    if not cid:
-        return True
-    if cid in seen_customers:
-        return False
-    seen_customers.add(cid)
-    return True
 
 def build_pareto_products(orders, vmap, variant_cost):
     """Group by parent product, summing revenue + COGS + gross profit."""
