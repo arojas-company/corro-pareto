@@ -216,92 +216,55 @@ def fetch_collections_map():
     """
     Build a map: product_id → [collection_title, ...]
     Uses Shopify GraphQL Admin API (collects.json was deprecated).
-    Paginates through all collections and their products.
+    First fetches all collection IDs+titles via REST, then fetches
+    products per collection via GraphQL using the collection GID.
     """
     print("  Fetching collections via GraphQL...")
-    url = f"https://{STORE_URL}/admin/api/{API_VERSION}/graphql.json"
+    url_gql = f"https://{STORE_URL}/admin/api/{API_VERSION}/graphql.json"
     headers = {
         "X-Shopify-Access-Token": TOKEN,
         "Content-Type": "application/json",
     }
 
-    prod_collections = defaultdict(list)
-    total_colls = 0
-    cursor = None
+    # Step 1: get all collections (id + title) via REST — still works
+    colls = {}
+    for c in shopify_get("custom_collections.json", {"limit": 250, "fields": "id,title"}):
+        colls[str(c["id"])] = c["title"]
+    for c in shopify_get("smart_collections.json", {"limit": 250, "fields": "id,title"}):
+        colls[str(c["id"])] = c["title"]
 
-    while True:
-        after = f', after: "{cursor}"' if cursor else ""
-        query = f"""
-        {{
-          collections(first: 50{after}) {{
-            pageInfo {{ hasNextPage endCursor }}
-            edges {{
-              node {{
-                title
-                products(first: 250) {{
+    # Step 2: for each collection, fetch its products via GraphQL (handles pagination)
+    prod_collections = defaultdict(list)
+    for cid, ctitle in colls.items():
+        gid = f"gid://shopify/Collection/{cid}"
+        prod_cursor = None
+        while True:
+            after = f', after: "{prod_cursor}"' if prod_cursor else ""
+            query = f"""
+            {{
+              collection(id: "{gid}") {{
+                products(first: 250{after}) {{
                   pageInfo {{ hasNextPage endCursor }}
-                  edges {{
-                    node {{ id }}
-                  }}
+                  edges {{ node {{ id }} }}
                 }}
               }}
             }}
-          }}
-        }}
-        """
-        r = requests.post(url, headers=headers, json={"query": query}, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        colls_data = data["data"]["collections"]
-
-        for edge in colls_data["edges"]:
-            node = edge["node"]
-            ctitle = node["title"]
-            total_colls += 1
-
-            # Paginate products within this collection if needed
-            prod_edges = node["products"]["edges"]
-            has_more = node["products"]["pageInfo"]["hasNextPage"]
-            prod_cursor = node["products"]["pageInfo"]["endCursor"]
-
-            for pe in prod_edges:
-                gid = pe["node"]["id"]  # "gid://shopify/Product/123456"
-                pid = gid.split("/")[-1]
+            """
+            r = requests.post(url_gql, headers=headers, json={"query": query}, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            coll_node = (data.get("data") or {}).get("collection")
+            if not coll_node:
+                break
+            products_page = coll_node["products"]
+            for pe in products_page["edges"]:
+                pid = pe["node"]["id"].split("/")[-1]
                 prod_collections[pid].append(ctitle)
+            if not products_page["pageInfo"]["hasNextPage"]:
+                break
+            prod_cursor = products_page["pageInfo"]["endCursor"]
 
-            # If collection has >250 products, paginate
-            while has_more:
-                inner_query = f"""
-                {{
-                  collections(first: 1{after}) {{
-                    edges {{
-                      node {{
-                        title
-                        products(first: 250, after: "{prod_cursor}") {{
-                          pageInfo {{ hasNextPage endCursor }}
-                          edges {{ node {{ id }} }}
-                        }}
-                      }}
-                    }}
-                  }}
-                }}
-                """
-                r2 = requests.post(url, headers=headers, json={"query": inner_query}, timeout=60)
-                r2.raise_for_status()
-                inner_data = r2.json()
-                for e2 in inner_data["data"]["collections"]["edges"]:
-                    for pe2 in e2["node"]["products"]["edges"]:
-                        gid2 = pe2["node"]["id"]
-                        pid2 = gid2.split("/")[-1]
-                        prod_collections[pid2].append(ctitle)
-                    has_more = e2["node"]["products"]["pageInfo"]["hasNextPage"]
-                    prod_cursor = e2["node"]["products"]["pageInfo"]["endCursor"]
-
-        if not colls_data["pageInfo"]["hasNextPage"]:
-            break
-        cursor = colls_data["pageInfo"]["endCursor"]
-
-    print(f"  → {total_colls} collections mapped")
+    print(f"  → {len(colls)} collections mapped")
     return prod_collections
 
 # ── ANALYSIS ──────────────────────────────────────────────────────
