@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Pareto Analysis — Equestrian Labs</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+[data-theme="light"]{
+  --bg:#F0EEE9;--sf:#FFFFFF;--sf2:#F5F3EF;--sf3:#EAE8E3;
+  --bd:#DEDAD3;--bd2:#C5C1B8;--tx:#0F0E0C;--tx2:#58564F;--tx3:#8E8C85;
+  --A:#0C7050;--A-bg:#D2F0E4;--A-bd:rgba(12,112,80,.18);
+  --B:#7D5E0E;--B-bg:#FEF3D2;--B-bd:rgba(125,94,14,.18);
+  --C:#8E3828;--C-bg:#FAE2DC;--C-bd:rgba(142,56,40,.18);
+  --bar-a:#0C7050;--bar-b:#D8B054;--bar-c:#D85A30;
+}
+[data-theme="dark"]{
+  --bg:#0A0A09;--sf:#141412;--sf2:#1C1C1A;--sf3:#242422;
+  --bd:#2A2A28;--bd2:#3C3C3A;--tx:#F0EFE8;--tx2:#C0BEB7;--tx3:#72706A;
+  --A:#2EE896;--A-bg:#0A3020;--A-bd:rgba(46,232,150,.2);
+  --B:#D8B054;--B-bg:#2A2008;--B-bd:rgba(216,176,84,.2);
+  --C:#F06868;--C-bg:#300808;--C-bd:rgba(240,104,104,.2);
+  --bar-a:#2EE896;--bar-b:#D8B054;--bar-c:#F06868;
+}
+html,body{min-height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);font-size:14px}
+.wrap{max-width:1200px;margin:0 auto;padding:24px 20px 60px}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+.brand-row{display:flex;align-items:flex-start;gap:8px}
+.brand-dot{width:8px;height:8px;border-radius:50%;background:var(--A);margin-top:3px;flex-shrink:0}
+.brand-name{font-family:'Syne',sans-serif;font-size:14px;font-weight:700;letter-spacing:-.02em}
+.brand-sub{font-size:10px;color:var(--tx3);margin-top:1px}
+h1{font-family:'Syne',sans-serif;font-size:24px;font-weight:800;letter-spacing:-.04em;line-height:1.1;margin-top:10px}
+h1 span{color:var(--A)}
+.period-info{font-size:11px;color:var(--tx3);margin-top:5px}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.sel-group{display:flex;flex-direction:column;gap:3px}
+.sel-label{font-size:9px;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.08em}
+select.psel{font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;color:var(--tx);
+  background:var(--sf2);border:1px solid var(--bd2);border-radius:6px;
+  padding:5px 26px 5px 10px;cursor:pointer;outline:none;appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 8px center;
+  min-width:120px;transition:border-color .12s}
+select.psel:focus{border-color:var(--A)}
+.divider-v{width:1px;height:32px;background:var(--bd2)}
+.rfbtn{display:flex;align-items:center;gap:4px;padding:5px 12px;border-radius:6px;
+  border:1px solid var(--bd2);background:var(--sf2);color:var(--tx2);cursor:pointer;
+  font-size:11px;font-weight:500;font-family:'DM Sans',sans-serif;transition:all .12s}
+.rfbtn:hover{border-color:var(--A);color:var(--A)}
+.tbtn{width:28px;height:28px;border-radius:50%;border:1px solid var(--bd2);background:var(--sf2);
+  color:var(--tx2);cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center}
+.sec{display:flex;align-items:center;gap:8px;margin:26px 0 11px}
+.sn{font-size:9px;font-weight:700;color:var(--tx3);letter-spacing:.12em;text-transform:uppercase;font-family:'Syne',sans-serif;white-space:nowrap}
+.sl{flex:1;height:1px;background:var(--bd)}
+.st{font-size:9px;font-weight:600;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:20px}
+.card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
+.card-l{font-size:10px;color:var(--tx3);font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
+.card-v{font-family:'Syne',sans-serif;font-size:22px;font-weight:700;letter-spacing:-.03em;line-height:1}
+.card-s{font-size:10px;color:var(--tx3);margin-top:4px}
+.cum-row{display:flex;height:26px;border-radius:7px;overflow:hidden;margin-bottom:9px;border:1px solid var(--bd)}
+.cum-seg{display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;
+  color:rgba(255,255,255,.9);transition:width .5s;cursor:default;overflow:hidden;white-space:nowrap}
+.legend{display:flex;gap:14px;flex-wrap:wrap}
+.leg-item{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--tx3)}
+.leg-dot{width:8px;height:8px;border-radius:2px}
+.insight{background:var(--A-bg);border:1px solid var(--A-bd);border-radius:8px;
+  padding:13px 16px;margin:14px 0 0;font-size:12px;color:var(--tx2);line-height:1.75}
+.insight strong{color:var(--A)}
+.tbl-wrap{background:var(--sf);border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+.tbl-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--bd)}
+.tbl-title{font-size:12px;font-weight:600;color:var(--tx2)}
+.tbl-note{font-size:10px;color:var(--tx3)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{padding:7px 12px;text-align:left;font-size:9px;font-weight:700;color:var(--tx3);
+  letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--bd);background:var(--sf2);white-space:nowrap}
+thead th.r{text-align:right}
+tbody tr{border-bottom:1px solid var(--bd);transition:background .1s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--sf2)}
+td{padding:8px 12px;color:var(--tx2);vertical-align:middle}
+td.r{text-align:right;font-family:'DM Mono',monospace;font-size:11px;color:var(--tx)}
+td.name{color:var(--tx);font-weight:500;max-width:220px}
+td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;margin-top:1px}
+.zone{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+  border-radius:5px;font-size:10px;font-weight:700;font-family:'Syne',sans-serif;flex-shrink:0}
+.zA{background:var(--A-bg);color:var(--A);border:1px solid var(--A-bd)}
+.zB{background:var(--B-bg);color:var(--B);border:1px solid var(--B-bd)}
+.zC{background:var(--C-bg);color:var(--C);border:1px solid var(--C-bd)}
+.bar-wrap{display:flex;align-items:center;gap:5px;min-width:100px}
+.bar-bg{flex:1;height:4px;background:var(--sf3);border-radius:2px;overflow:hidden}
+.bar-fill{height:100%;border-radius:2px;transition:width .4s}
+.bar-pct{font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3);min-width:34px;text-align:right}
+.ch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px}
+.chc{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
+.chc-name{font-size:10px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+.chc-v{font-family:'Syne',sans-serif;font-size:20px;font-weight:700;letter-spacing:-.02em}
+.chc-sub{font-size:10px;color:var(--tx3);margin-top:2px}
+.chc-bar{height:3px;background:var(--bd2);border-radius:2px;margin-top:9px;overflow:hidden}
+.chc-barf{height:100%;border-radius:2px;transition:width .5s}
+.ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;
+  align-items:center;justify-content:center;flex-direction:column;gap:10px;backdrop-filter:blur(4px)}
+.ov.show{display:flex}
+.spi{width:26px;height:26px;border:2px solid var(--bd2);border-top-color:var(--A);border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.ov-t{font-size:12px;color:var(--tx);background:var(--sf);padding:7px 16px;border-radius:20px;border:1px solid var(--bd2)}
+.empty{padding:28px;text-align:center;font-size:12px;color:var(--tx3)}
+@media(max-width:640px){h1{font-size:20px}.wrap{padding:16px 14px 40px}.cards{grid-template-columns:repeat(2,1fr)}table{font-size:11px}td,thead th{padding:6px 8px}}
+</style>
+</head>
+<body>
+<div class="ov" id="ov"><div class="spi"></div><div class="ov-t" id="ov-t">Loading...</div></div>
+
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div class="brand-row">
+        <div class="brand-dot"></div>
+        <div><div class="brand-name">Equestrian Labs — Corro</div><div class="brand-sub">Pareto Analysis · Shopify → Sheets</div></div>
+      </div>
+      <h1>Revenue <span>Pareto</span></h1>
+      <div class="period-info" id="period-info">—</div>
+    </div>
+    <div class="controls">
+      <div class="sel-group">
+        <div class="sel-label">Year</div>
+        <select class="psel" id="sel-year" onchange="render()"></select>
+      </div>
+      <div class="sel-group">
+        <div class="sel-label">Period</div>
+        <select class="psel" id="sel-type" onchange="render()">
+          <option value="full_year">Full Year</option>
+          <option value="q1">Q1 — Jan to Mar</option>
+          <option value="q2">Q2 — Apr to Jun</option>
+          <option value="q3">Q3 — Jul to Sep</option>
+          <option value="q4">Q4 — Oct to Dec</option>
+        </select>
+      </div>
+      <div class="divider-v"></div>
+      <button class="rfbtn" onclick="forceRefresh()">
+        <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M10 6a4 4 0 1 1-.8-2.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M10 2v2.5H7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Refresh
+      </button>
+      <button class="tbtn" onclick="toggleTheme()">☀</button>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="card-l">Net Revenue</div><div class="card-v" id="s-rev">—</div></div>
+    <div class="card"><div class="card-l">Orders</div><div class="card-v" id="s-ord">—</div></div>
+    <div class="card"><div class="card-l">Products</div><div class="card-v" id="s-prod">—</div></div>
+    <div class="card"><div class="card-l">Zone A</div><div class="card-v" id="s-za">—</div><div class="card-s">products = 80% revenue</div></div>
+    <div class="card"><div class="card-l">Top Product</div><div class="card-v" id="s-top1">—</div><div class="card-s" id="s-top1-name">of revenue</div></div>
+    <div class="card"><div class="card-l">Updated</div><div class="card-v" style="font-size:13px;margin-top:2px" id="s-upd">—</div></div>
+  </div>
+
+  <div class="sec"><div class="sn">Overview</div><div class="sl"></div><div class="st">Cumulative revenue by zone</div></div>
+  <div class="cum-row" id="cum-bar"></div>
+  <div class="legend">
+    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-a)"></div>Zone A — 80% of revenue</div>
+    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-b)"></div>Zone B — 80–95%</div>
+    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-c)"></div>Zone C — tail</div>
+  </div>
+  <div class="insight" id="insight">Select a year and period above.</div>
+
+  <div class="sec"><div class="sn">01</div><div class="sl"></div><div class="st">By Product — all variants of same product grouped together</div></div>
+  <div class="tbl-wrap">
+    <div class="tbl-head"><div class="tbl-title">Top Products by Net Revenue</div><div class="tbl-note" id="prod-note">—</div></div>
+    <div id="tbl-products"><div class="empty">Select a period above</div></div>
+  </div>
+
+  <div class="sec"><div class="sn">02</div><div class="sl"></div><div class="st">By Category / Shopify Collection</div></div>
+  <div class="tbl-wrap">
+    <div class="tbl-head"><div class="tbl-title">Revenue by Category</div><div class="tbl-note">Main collection — not subcategory</div></div>
+    <div id="tbl-categories"><div class="empty">Select a period above</div></div>
+  </div>
+
+  <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">By Sales Channel</div></div>
+  <div class="ch-grid" id="ch-grid"></div>
+
+  <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">Top Customers</div></div>
+  <div class="tbl-wrap">
+    <div class="tbl-head"><div class="tbl-title">Top 25 Customers by Net Revenue</div><div class="tbl-note">Zone A = strategic accounts</div></div>
+    <div id="tbl-customers"><div class="empty">Select a period above</div></div>
+  </div>
+
+  <div class="sec"><div class="sn">05</div><div class="sl"></div><div class="st">New vs Returning customers — revenue summary</div></div>
+  <div id="nvr-panel"></div>
+
+  <div style="margin-top:22px;font-size:10px;color:var(--tx3);text-align:center">
+    Google Sheets ← pareto_v1.py ← Shopify API &nbsp;·&nbsp; <span id="footer-lbl">—</span>
+  </div>
+</div>
+
+<script>
+const SHEET_ID  = "1nq8xkDzowAvhD3wpMBlVK2M3FZSNS2DrAiPxz-Y2tdU";
+const AKEY      = "AIzaSyD8oIf_TyxchEkU_MpKJXngrjrMVyV81oY";
+const START_YEAR = 2024;
+const CY = new Date().getFullYear();
+
+let cache = {};
+const $ = id => document.getElementById(id);
+
+// ── BUILD YEAR OPTIONS ────────────────────────────────────────────
+function buildYears(){
+  const sel=$("sel-year"); sel.innerHTML="";
+  for(let y=CY;y>=START_YEAR;y--){
+    const o=document.createElement("option");
+    o.value=y; o.textContent=y;
+    if(y===2025) o.selected=true;
+    sel.appendChild(o);
+  }
+}
+
+// ── PERIOD KEY ────────────────────────────────────────────────────
+function getPeriodKey(){
+  const y=$("sel-year").value, t=$("sel-type").value;
+  return t==="full_year" ? `full_year_${y}` : `${t}_${y}`;
+}
+function getPeriodLabel(){
+  const y=$("sel-year").value, t=$("sel-type").value;
+  const map={full_year:`Full Year ${y}`,q1:`Q1 ${y} (Jan–Mar)`,q2:`Q2 ${y} (Apr–Jun)`,q3:`Q3 ${y} (Jul–Sep)`,q4:`Q4 ${y} (Oct–Dec)`};
+  return map[t]||`${t} ${y}`;
+}
+
+// ── FORMAT ────────────────────────────────────────────────────────
+function fmt$(v){const n=parseFloat(v)||0;if(n>=1e6)return"$"+(n/1e6).toFixed(2)+"M";if(n>=1000)return"$"+(n/1000).toFixed(1)+"K";return"$"+Math.round(n).toLocaleString()}
+function fmtN(v){const n=parseInt(v)||0;if(n>=1000)return(n/1000).toFixed(1)+"K";return n.toLocaleString()}
+function fmtP(v){return(parseFloat(v)||0).toFixed(1)+"%"}
+function zCls(z){return z==="A"?"zA":z==="B"?"zB":"zC"}
+function zClr(z){return z==="A"?"var(--bar-a)":z==="B"?"var(--bar-b)":"var(--bar-c)"}
+
+// ── FETCH ─────────────────────────────────────────────────────────
+async function fetchTab(tab){
+  if(cache[tab]) return cache[tab];
+  const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tab)}?key=${AKEY}`;
+  try{
+    const r=await fetch(url);if(!r.ok)throw new Error(r.status);
+    const d=await r.json();const rows=d.values||[];
+    if(rows.length<2)return[];
+    const h=rows[0];
+    const res=rows.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=row[i]||"");return o;});
+    cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);
+    return res;
+  }catch(e){console.error(tab,e);return[];}
+}
+function byPeriod(rows,pk){return rows.filter(r=>(r.period||"").trim()===pk).sort((a,b)=>parseInt(a.rank)-parseInt(b.rank))}
+
+// ── SUMMARY ───────────────────────────────────────────────────────
+function renderSummary(fp){
+  if(!fp.length){["s-rev","s-ord","s-prod","s-za","s-top1"].forEach(id=>$(id).textContent="—");return;}
+  const total=fp.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const orders=fp.reduce((a,r)=>a+parseInt(r.orders||0),0);
+  const za=fp.filter(r=>r.pareto_zone==="A").length;
+  $("s-rev").textContent=fmt$(total);
+  $("s-ord").textContent=fmtN(orders);
+  $("s-prod").textContent=fp.length;
+  $("s-za").textContent=za;
+  $("s-top1").textContent=fmtP(fp[0]?.pct_revenue||0);
+  $("s-top1-name").textContent=(fp[0]?.product_title||"").split(" ").slice(0,5).join(" ");
+  $("s-upd").textContent=(fp[0]?.updated_at||"").slice(0,10)||"—";
+}
+
+// ── PARETO BAR ────────────────────────────────────────────────────
+function renderCumBar(fp){
+  const bar=$("cum-bar");bar.innerHTML="";
+  if(!fp.length)return;
+  const z={A:0,B:0,C:0};
+  fp.forEach(r=>z[r.pareto_zone]=(z[r.pareto_zone]||0)+parseFloat(r.pct_revenue||0));
+  [["A","var(--bar-a)"],["B","var(--bar-b)"],["C","var(--bar-c)"]].forEach(([zn,c])=>{
+    const p=z[zn]||0;if(p<0.5)return;
+    const s=document.createElement("div");s.className="cum-seg";
+    s.style.cssText=`width:${p}%;background:${c}`;
+    s.title=`Zone ${zn}: ${p.toFixed(1)}% of revenue`;
+    s.textContent=p>8?`Zone ${zn} · ${p.toFixed(0)}%`:p>4?zn:"";
+    bar.appendChild(s);
+  });
+}
+
+// ── INSIGHT ───────────────────────────────────────────────────────
+function renderInsight(fp,fc,fh,label){
+  if(!fp.length){$("insight").textContent="No data found. Run pareto_v1.py with this period first.";return;}
+  const za=fp.filter(r=>r.pareto_zone==="A");
+  const zaRev=za.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const top3=fp.slice(0,3).map(r=>`<strong>${(r.product_title||"").split(" ").slice(0,4).join(" ")}</strong>`).join(", ");
+  $("insight").innerHTML=`In <strong>${label}</strong>: <strong>${za.length} product${za.length!==1?"s":""}</strong> of ${fp.length} total
+    generate <strong>80% of revenue</strong> (${fmt$(zaRev)}).
+    Top sellers: ${top3}.
+    ${fc[0]?` &nbsp;·&nbsp; Leading category: <strong>${fc[0].category}</strong> (${fmtP(fc[0].pct_revenue)}).`:""}
+    ${fh[0]?` &nbsp;·&nbsp; Top channel: <strong>${fh[0].channel}</strong> (${fmtP(fh[0].pct_revenue)}).`:""}
+    <br><em style="color:var(--tx3);font-size:11px">Zone A products are your strategic levers — focus investment here first.</em>`;
+}
+
+// ── PRODUCTS ──────────────────────────────────────────────────────
+function gpClr(gp){const n=parseFloat(gp)||0;return n<0?"var(--C)":n<20?"var(--B)":"var(--A)"}
+function renderProducts(rows){
+  const el=$("tbl-products");
+  const hasCogs=rows.some(r=>parseFloat(r.cogs||0)>0);
+  $("prod-note").textContent=rows.length?`${rows.length} products — variants grouped · ${hasCogs?"COGS loaded":"no COGS — set Cost per item in Shopify Admin"}`:"No data";
+  if(!rows.length){el.innerHTML=`<div class="empty">No data. Run: python pareto_v1.py --only ${getPeriodKey()}</div>`;return;}
+  const show=rows.slice(0,50);
+  el.innerHTML=`<table><thead><tr>
+    <th>#</th><th>Zone</th><th>Product</th><th>Type</th>
+    <th class="r">Gross Sales</th><th class="r">Net Sales</th>
+    <th class="r">COGS</th><th class="r">Gross Profit</th><th class="r">GP%</th>
+    <th class="r">% Revenue</th><th class="r">Cumulative</th>
+    <th class="r">Units</th><th class="r">Orders</th><th>Top Channel</th>
+  </tr></thead><tbody>${show.map(r=>`<tr>
+    <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
+    <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
+    <td class="name">${r.product_title||"—"}<small>${r.sku_parent||r.vendor||""}</small></td>
+    <td style="font-size:10px;color:var(--tx3)">${r.product_type||"—"}</td>
+    <td class="r">${fmt$(r.gross_sales)}</td>
+    <td class="r">${fmt$(r.net_sales)}</td>
+    <td class="r" style="color:var(--tx3)">${fmt$(r.cogs)}</td>
+    <td class="r" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
+    <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
+    <td class="r"><div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${zClr(r.pareto_zone)}"></div></div><span class="bar-pct">${fmtP(r.pct_revenue)}</span></div></td>
+    <td class="r" style="font-family:'DM Mono',monospace;font-size:11px">${fmtP(r.cum_pct)}</td>
+    <td class="r">${fmtN(r.units)}</td>
+    <td class="r">${fmtN(r.orders)}</td>
+    <td style="font-size:10px;color:var(--tx3)">${r.top_channel||"—"}</td>
+  </tr>`).join("")}</tbody></table>
+  ${rows.length>50?`<div style="padding:9px 14px;font-size:10px;color:var(--tx3)">Top 50 of ${rows.length}. Full list in Google Sheets pareto_products tab.</div>`:""}`;
+}
+
+// ── CATEGORIES ────────────────────────────────────────────────────
+function renderCategories(rows){
+  const el=$("tbl-categories");
+  if(!rows.length){el.innerHTML=`<div class="empty">No data.</div>`;return;}
+  el.innerHTML=`<table><thead><tr>
+    <th>#</th><th>Zone</th><th>Category / Collection</th>
+    <th class="r">Gross Sales</th><th class="r">Net Sales</th>
+    <th class="r">COGS</th><th class="r">Gross Profit</th><th class="r">GP%</th>
+    <th class="r">% Revenue</th><th class="r">Cumulative</th>
+    <th class="r">Units</th><th class="r">Orders</th>
+  </tr></thead><tbody>${rows.map(r=>`<tr>
+    <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
+    <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
+    <td class="name">${r.category||"Uncategorized"}</td>
+    <td class="r">${fmt$(r.gross_sales)}</td>
+    <td class="r">${fmt$(r.net_sales)}</td>
+    <td class="r" style="color:var(--tx3)">${fmt$(r.cogs)}</td>
+    <td class="r" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
+    <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
+    <td class="r"><div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${zClr(r.pareto_zone)}"></div></div><span class="bar-pct">${fmtP(r.pct_revenue)}</span></div></td>
+    <td class="r" style="font-family:'DM Mono',monospace;font-size:11px">${fmtP(r.cum_pct)}</td>
+    <td class="r">${fmtN(r.units)}</td>
+    <td class="r">${fmtN(r.orders)}</td>
+  </tr>`).join("")}</tbody></table>`;
+}
+
+// ── CHANNELS ──────────────────────────────────────────────────────
+const CH_COLORS={"Wellington (POS)":"#D8B054","Concierge":"#A090FF","Online (Ecom)":"#72AEFF","Others":"#888"};
+function renderChannels(rows){
+  const el=$("ch-grid");el.innerHTML="";
+  if(!rows.length){el.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
+  rows.forEach(r=>{
+    const c=CH_COLORS[r.channel]||"#888";
+    const d=document.createElement("div");d.className="chc";
+    d.innerHTML=`<div class="chc-name">${r.channel}</div>
+      <div class="chc-v" style="color:${c}">${fmt$(r.net_sales)}</div>
+      <div class="chc-sub">${fmtP(r.pct_revenue)} &nbsp;·&nbsp; ${fmtN(r.orders)} orders &nbsp;·&nbsp; ${fmtN(r.units)} units</div>
+      <div class="chc-bar"><div class="chc-barf" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${c}"></div></div>`;
+    el.appendChild(d);
+  });
+}
+
+// ── CUSTOMERS ─────────────────────────────────────────────────────
+function segBadge(s){const new_=s==="New";return `<span style="font-size:9px;padding:1px 6px;border-radius:20px;background:${new_?"var(--A-bg)":"var(--B-bg)"};color:${new_?"var(--A)":"var(--B)";border:.5px solid ${new_?"var(--A-bd)":"var(--B-bd)"}}">${s||"—"}</span>`}
+function renderCustomers(rows){
+  const el=$("tbl-customers");
+  if(!rows.length){el.innerHTML=`<div class="empty">No data.</div>`;return;}
+  el.innerHTML=`<table><thead><tr>
+    <th>#</th><th>Zone</th><th>Customer</th><th>Segment</th>
+    <th class="r">Net Sales</th><th class="r">% Revenue</th><th class="r">Cumulative</th>
+    <th class="r">Orders</th><th class="r">Units</th><th>Last Order</th>
+  </tr></thead><tbody>${rows.slice(0,25).map(r=>`<tr>
+    <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
+    <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
+    <td class="name">${r.name||"Guest"}<small>${r.email||""}</small></td>
+    <td>${segBadge(r.segment)}</td>
+    <td class="r">${fmt$(r.net_sales)}</td>
+    <td class="r"><div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${zClr(r.pareto_zone)}"></div></div><span class="bar-pct">${fmtP(r.pct_revenue)}</span></div></td>
+    <td class="r" style="font-family:'DM Mono',monospace;font-size:11px">${fmtP(r.cum_pct)}</td>
+    <td class="r">${r.orders}</td>
+    <td class="r">${fmtN(r.units)}</td>
+    <td style="font-size:10px;color:var(--tx3)">${r.last_order||"—"}</td>
+  </tr>`).join("")}</tbody></table>`;
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────
+function renderNVR(rows){
+  const el=$("nvr-panel"); if(!el)return;
+  if(!rows.length){el.innerHTML=`<div class="empty" style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px">No data. Run pipeline first.</div>`;return;}
+  const total_rev=rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  el.innerHTML=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px">${rows.map(r=>{
+    const isNew=(r.segment||"").toLowerCase()==="new";
+    const clr=isNew?"var(--A)":"var(--B)";
+    const bg=isNew?"var(--A-bg)":"var(--B-bg)";
+    const bd=isNew?"var(--A-bd)":"var(--B-bd)";
+    return `<div style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px;padding:14px 16px">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);margin-bottom:6px">${r.segment} Customers</div>
+      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;color:${clr}">${fmt$(r.net_sales)}</div>
+      <div style="font-size:11px;color:var(--tx3);margin-top:3px">${fmtP(r.pct_revenue)} of period revenue &nbsp;·&nbsp; ${fmtN(r.customers)} customers &nbsp;·&nbsp; ${fmtN(r.orders)} orders</div>
+      <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:10px;overflow:hidden"><div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${clr}"></div></div>
+    </div>`;
+  }).join("")}</div>`;
+}
+
+async function render(){
+  const pk=getPeriodKey(), label=getPeriodLabel();
+  $("ov").classList.add("show");
+  $("ov-t").textContent=`Loading ${label}...`;
+  $("period-info").textContent=label;
+  $("footer-lbl").textContent=label;
+
+  const [products,categories,channels,customers,nvr]=await Promise.all([
+    fetchTab("pareto_products"),fetchTab("pareto_categories"),
+    fetchTab("pareto_channels"),fetchTab("pareto_customers"),
+    fetchTab("pareto_new_vs_ret"),
+  ]);
+
+  const fp=byPeriod(products,pk), fc=byPeriod(categories,pk);
+  const fh=byPeriod(channels,pk), fcu=byPeriod(customers,pk);
+  const fnvr=byPeriod(nvr,pk);
+
+  if(fp[0]?.period_start)
+    $("period-info").textContent=`${label} · ${fp[0].period_start} → ${fp[0].period_end}`;
+
+  renderSummary(fp);
+  renderCumBar(fp);
+  renderInsight(fp,fc,fh,label);
+  renderProducts(fp);
+  renderCategories(fc);
+  renderChannels(fh);
+  renderCustomers(fcu);
+  renderNVR(fnvr);
+
+  $("ov").classList.remove("show");
+}
+
+function forceRefresh(){cache={};render();}
+function toggleTheme(){
+  const h=document.documentElement,dk=h.getAttribute("data-theme")==="dark";
+  h.setAttribute("data-theme",dk?"light":"dark");
+  document.querySelector(".tbtn").textContent=dk?"☀":"☾";
+}
+
+buildYears();
+// Default: Q4 2025 as Ceci requested
+document.getElementById("sel-year").value="2025";
+document.getElementById("sel-type").value="q4";
+render();
+</script>
+</body>
+</html>
