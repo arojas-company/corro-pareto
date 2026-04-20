@@ -215,27 +215,93 @@ def fetch_products_map():
 def fetch_collections_map():
     """
     Build a map: product_id → [collection_title, ...]
-    Custom collections + smart collections.
+    Uses Shopify GraphQL Admin API (collects.json was deprecated).
+    Paginates through all collections and their products.
     """
-    print("  Fetching collections...")
-    colls = {}
-    # Custom collections
-    for c in shopify_get("custom_collections.json", {"limit": 250, "fields": "id,title"}):
-        colls[str(c["id"])] = c["title"]
-    # Smart collections
-    for c in shopify_get("smart_collections.json", {"limit": 250, "fields": "id,title"}):
-        colls[str(c["id"])] = c["title"]
+    print("  Fetching collections via GraphQL...")
+    url = f"https://{STORE_URL}/admin/api/{API_VERSION}/graphql.json"
+    headers = {
+        "X-Shopify-Access-Token": TOKEN,
+        "Content-Type": "application/json",
+    }
 
-    # Collect membership: which products belong to which collections
     prod_collections = defaultdict(list)
-    for cid, ctitle in colls.items():
-        collects = shopify_get("collects.json", {
-            "collection_id": cid, "limit": 250, "fields": "product_id"
-        })
-        for co in collects:
-            prod_collections[str(co["product_id"])].append(ctitle)
+    total_colls = 0
+    cursor = None
 
-    print(f"  → {len(colls)} collections mapped")
+    while True:
+        after = f', after: "{cursor}"' if cursor else ""
+        query = f"""
+        {{
+          collections(first: 50{after}) {{
+            pageInfo {{ hasNextPage endCursor }}
+            edges {{
+              node {{
+                title
+                products(first: 250) {{
+                  pageInfo {{ hasNextPage endCursor }}
+                  edges {{
+                    node {{ id }}
+                  }}
+                }}
+              }}
+            }}
+          }}
+        }}
+        """
+        r = requests.post(url, headers=headers, json={"query": query}, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        colls_data = data["data"]["collections"]
+
+        for edge in colls_data["edges"]:
+            node = edge["node"]
+            ctitle = node["title"]
+            total_colls += 1
+
+            # Paginate products within this collection if needed
+            prod_edges = node["products"]["edges"]
+            has_more = node["products"]["pageInfo"]["hasNextPage"]
+            prod_cursor = node["products"]["pageInfo"]["endCursor"]
+
+            for pe in prod_edges:
+                gid = pe["node"]["id"]  # "gid://shopify/Product/123456"
+                pid = gid.split("/")[-1]
+                prod_collections[pid].append(ctitle)
+
+            # If collection has >250 products, paginate
+            while has_more:
+                inner_query = f"""
+                {{
+                  collections(first: 1{after}) {{
+                    edges {{
+                      node {{
+                        title
+                        products(first: 250, after: "{prod_cursor}") {{
+                          pageInfo {{ hasNextPage endCursor }}
+                          edges {{ node {{ id }} }}
+                        }}
+                      }}
+                    }}
+                  }}
+                }}
+                """
+                r2 = requests.post(url, headers=headers, json={"query": inner_query}, timeout=60)
+                r2.raise_for_status()
+                inner_data = r2.json()
+                for e2 in inner_data["data"]["collections"]["edges"]:
+                    for pe2 in e2["node"]["products"]["edges"]:
+                        gid2 = pe2["node"]["id"]
+                        pid2 = gid2.split("/")[-1]
+                        prod_collections[pid2].append(ctitle)
+                    has_more = e2["node"]["products"]["pageInfo"]["hasNextPage"]
+                    prod_cursor = e2["node"]["products"]["pageInfo"]["endCursor"]
+
+        if not colls_data["pageInfo"]["hasNextPage"]:
+            break
+        cursor = colls_data["pageInfo"]["endCursor"]
+
+    print(f"  → {total_colls} collections mapped")
     return prod_collections
 
 # ── ANALYSIS ──────────────────────────────────────────────────────
