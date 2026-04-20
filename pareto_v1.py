@@ -75,13 +75,22 @@ def resolve_single(key, start_override=None, end_override=None):
     raise ValueError(f"Unknown period: {key}. Use full_year_YYYY, qN_YYYY, or custom.")
 
 # ── SHOPIFY REST ──────────────────────────────────────────────────
+import time
+
 def shopify_get(endpoint, params):
     url = f"https://{STORE_URL}/admin/api/{API_VERSION}/{endpoint}"
     headers = {"X-Shopify-Access-Token": TOKEN}
     results = []
     while url:
-        r = requests.get(url, headers=headers, params=params, timeout=60)
-        r.raise_for_status()
+        for attempt in range(6):
+            r = requests.get(url, headers=headers, params=params, timeout=60)
+            if r.status_code == 429:
+                wait = int(r.headers.get("Retry-After", 2 ** attempt))
+                print(f"    rate-limited — waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            break
         data = r.json()
         key = [k for k in data if k != "errors"][0]
         results.extend(data[key])
@@ -90,6 +99,7 @@ def shopify_get(endpoint, params):
             for part in link.split(","):
                 if 'rel="next"' in part:
                     url = part.split(";")[0].strip().strip("<>")
+        time.sleep(0.3)  # 3 req/sec steady state stays under burst limit
     return results
 
 def fetch_orders(start, end):
@@ -141,17 +151,32 @@ def fetch_cogs_map():
     return variant_cost
 
 def fetch_collections_map():
-    print("  Fetching collections...")
+    """
+    Build product_id → [collection_title] map.
+    Strategy: paginate ALL collects at once (no per-collection calls)
+    then join with collection titles. Much fewer API calls than 615 individual requests.
+    """
+    print("  Fetching collections (titles)...")
     colls = {}
     for c in shopify_get("custom_collections.json", {"limit": 250, "fields": "id,title"}):
         colls[str(c["id"])] = c["title"]
     for c in shopify_get("smart_collections.json", {"limit": 250, "fields": "id,title"}):
         colls[str(c["id"])] = c["title"]
+    print(f"  → {len(colls)} collection titles loaded")
+
+    # Fetch ALL collects in bulk (paginated) — no per-collection filter
+    # This is O(products) API calls instead of O(collections) calls
+    print("  Fetching all collects (product↔collection memberships)...")
     prod_colls = defaultdict(list)
-    for cid, ctitle in colls.items():
-        for co in shopify_get("collects.json", {"collection_id": cid, "limit": 250, "fields": "product_id"}):
-            prod_colls[str(co["product_id"])].append(ctitle)
-    print(f"  → {len(colls)} collections")
+    all_collects = shopify_get("collects.json", {"limit": 250, "fields": "collection_id,product_id"})
+    for co in all_collects:
+        cid = str(co.get("collection_id", ""))
+        pid = str(co.get("product_id", ""))
+        title = colls.get(cid)
+        if title and pid:
+            if title not in prod_colls[pid]:  # avoid duplicates
+                prod_colls[pid].append(title)
+    print(f"  → {len(prod_colls)} products mapped to collections")
     return prod_colls
 
 # ── CHANNEL DETECTION ─────────────────────────────────────────────
