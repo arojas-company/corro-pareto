@@ -427,8 +427,10 @@ def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
                 clean.append("")
             elif isinstance(v, float) and (v != v):  # NaN check
                 clean.append("")
+            elif hasattr(v, 'strftime'):  # date/datetime object -> force string
+                clean.append(v.strftime("%Y-%m-%d"))
             else:
-                clean.append(v)
+                clean.append(str(v) if not isinstance(v, (int, float, bool)) else v)
         all_data.append(clean)
 
     total_rows = len(all_data)
@@ -451,7 +453,7 @@ def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
         batch = all_data[i:i + BATCH_SIZE]
         sheets_call(
             ws.append_rows, batch,
-            value_input_option="USER_ENTERED",
+            value_input_option="RAW",
             insert_data_option="INSERT_ROWS",
         )
         written += len(batch)
