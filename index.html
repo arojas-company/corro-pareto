@@ -36,13 +36,18 @@ h1 span{color:var(--A)}
 .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
 .sel-group{display:flex;flex-direction:column;gap:3px}
 .sel-label{font-size:9px;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.08em}
-select.psel{font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;color:var(--tx);
-  background:var(--sf2);border:1px solid var(--bd2);border-radius:6px;
+select.psel{font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;
+  color:#F0EFE8 !important;
+  background:#1C1C1A !important;
+  border:1px solid var(--bd2);border-radius:6px;
   padding:5px 26px 5px 10px;cursor:pointer;outline:none;appearance:none;
-  background-image:url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-image:url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23aaa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   background-repeat:no-repeat;background-position:right 8px center;
   min-width:120px;transition:border-color .12s}
 select.psel:focus{border-color:var(--A)}
+select.psel option{background:#1C1C1A;color:#F0EFE8}
+[data-theme="light"] select.psel{color:#0F0E0C !important;background:#F5F3EF !important}
+[data-theme="light"] select.psel option{background:#F5F3EF;color:#0F0E0C}
 .divider-v{width:1px;height:32px;background:var(--bd2)}
 .rfbtn{display:flex;align-items:center;gap:4px;padding:5px 12px;border-radius:6px;
   border:1px solid var(--bd2);background:var(--sf2);color:var(--tx2);cursor:pointer;
@@ -125,7 +130,11 @@ td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;marg
     <div class="controls">
       <div class="sel-group">
         <div class="sel-label">Year</div>
-        <select class="psel" id="sel-year" onchange="render()"></select>
+        <select class="psel" id="sel-year" onchange="render()">
+          <option value="2026">2026</option>
+          <option value="2025" selected>2025</option>
+          <option value="2024">2024</option>
+        </select>
       </div>
       <div class="sel-group">
         <div class="sel-label">Period</div>
@@ -204,13 +213,7 @@ const $ = id => document.getElementById(id);
 
 // ── BUILD YEAR OPTIONS ────────────────────────────────────────────
 function buildYears(){
-  const sel=$("sel-year"); sel.innerHTML="";
-  for(let y=CY;y>=START_YEAR;y--){
-    const o=document.createElement("option");
-    o.value=y; o.textContent=y;
-    if(y===2025) o.selected=true;
-    sel.appendChild(o);
-  }
+  // Years are hardcoded in HTML select — nothing to do here
 }
 
 // ── PERIOD KEY ────────────────────────────────────────────────────
@@ -232,18 +235,104 @@ function zCls(z){return z==="A"?"zA":z==="B"?"zB":"zC"}
 function zClr(z){return z==="A"?"var(--bar-a)":z==="B"?"var(--bar-b)":"var(--bar-c)"}
 
 // ── FETCH ─────────────────────────────────────────────────────────
+function parseCSV(text){
+  // Robust CSV parser that handles quoted fields with commas/newlines
+  const rows=[];
+  let row=[],field="",inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i],nc=text[i+1];
+    if(inQ){
+      if(c==='"'&&nc==='"'){field+='"';i++;}
+      else if(c==='"'){inQ=false;}
+      else{field+=c;}
+    } else {
+      if(c==='"'){inQ=true;}
+      else if(c===','){row.push(field);field="";}
+      else if(c==='\r'&&nc==='\n'){row.push(field);rows.push(row);row=[];field="";i++;}
+      else if(c==='\n'||c==='\r'){row.push(field);rows.push(row);row=[];field="";}
+      else{field+=c;}
+    }
+  }
+  if(field||row.length){row.push(field);rows.push(row);}
+  return rows.filter(r=>r.some(c=>c.trim()!==""));
+}
+
 async function fetchTab(tab){
   if(cache[tab]) return cache[tab];
-  const url=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tab)}?key=${AKEY}`;
+  // Use CSV export — works with any "Anyone with link can view" Sheet
+  // No API key needed, no domain restrictions
+  const GID_MAP={
+    "pareto_products":   null,
+    "pareto_categories": null,
+    "pareto_channels":   null,
+    "pareto_customers":  null,
+    "pareto_new_vs_ret": null,
+  };
+  // First try: Sheets API with key (works if key has no domain restrictions)
+  const apiUrl=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tab)}?key=${AKEY}`;
   try{
-    const r=await fetch(url);if(!r.ok)throw new Error(r.status);
-    const d=await r.json();const rows=d.values||[];
-    if(rows.length<2)return[];
+    const r=await fetch(apiUrl);
+    if(r.ok){
+      const d=await r.json();
+      if(!d.error&&d.values&&d.values.length>=2){
+        const h=d.values[0];
+        const res=d.values.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=row[i]||"");return o;});
+        cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);
+        console.log("API OK: "+tab+" ("+res.length+" rows)");
+        return res;
+      }
+    }
+    console.warn("API failed for "+tab+" ("+r.status+"), trying CSV export...");
+  }catch(e){
+    console.warn("API error for "+tab+": "+e.message+", trying CSV export...");
+  }
+
+  // Fallback: CSV export URL — always works with public Sheets, no API key
+  const csvUrl=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}`;
+  try{
+    const r=await fetch(csvUrl);
+    if(!r.ok){
+      showError(`Cannot load tab "${tab}" (HTTP ${r.status}). Make sure the Sheet is shared as "Anyone with the link can view".`);
+      return[];
+    }
+    const text=await r.text();
+    if(!text||text.trim()===""){
+      showError(`Tab "${tab}" is empty. Run the pipeline first.`);
+      return[];
+    }
+    // Check if we got an error page instead of CSV
+    if(text.includes("<html")||text.includes("<!DOCTYPE")){
+      showError(`Tab "${tab}": Sheet is not publicly accessible. Go to Share → "Anyone with the link" → Viewer.`);
+      return[];
+    }
+    const rows=parseCSV(text);
+    if(rows.length<2){
+      showError(`Tab "${tab}" has no data rows. Run the pipeline first.`);
+      return[];
+    }
     const h=rows[0];
-    const res=rows.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=row[i]||"");return o;});
+    const res=rows.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=(row[i]||"").trim();return o;});
     cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);
+    console.log("CSV OK: "+tab+" ("+res.length+" rows)");
     return res;
-  }catch(e){console.error(tab,e);return[];}
+  }catch(e){
+    showError(`Error loading "${tab}": ${e.message}`);
+    console.error(tab,e);
+    return[];
+  }
+}
+
+function showError(msg){
+  let box=document.getElementById("err-box");
+  if(!box){
+    box=document.createElement("div");
+    box.id="err-box";
+    box.style.cssText="background:#300808;border:1px solid #F06868;border-radius:8px;padding:12px 16px;margin:10px 0;font-size:12px;color:#F06868;font-family:monospace;white-space:pre-wrap;";
+    const wrap=document.querySelector(".wrap");
+    const h1=wrap.querySelector("h1");
+    h1.parentNode.insertBefore(box,h1.nextSibling);
+  }
+  box.textContent=(box.textContent?box.textContent+"\n":"")+msg;
 }
 function byPeriod(rows,pk){return rows.filter(r=>(r.period||"").trim()===pk).sort((a,b)=>parseInt(a.rank)-parseInt(b.rank))}
 
@@ -410,6 +499,19 @@ function renderNVR(rows){
 }
 
 async function render(){
+  const eb=document.getElementById("err-box");
+  if(eb) eb.textContent="";
+
+  const selY=$("sel-year");
+  const yr=selY.value;
+  console.log("render() called — year="+yr+" options="+selY.options.length+" SHEET_ID="+SHEET_ID.slice(0,8)+"...");
+
+  if(!yr){
+    showError("Year selector empty ("+selY.options.length+" options). Retrying in 500ms...");
+    setTimeout(()=>{buildYears();render();},500);
+    return;
+  }
+
   const pk=getPeriodKey(), label=getPeriodLabel();
   $("ov").classList.add("show");
   $("ov-t").textContent=`Loading ${label}...`;
@@ -448,10 +550,9 @@ function toggleTheme(){
   document.querySelector(".tbtn").textContent=dk?"☀":"☾";
 }
 
-buildYears();
-// Default: Q4 2025 as Ceci requested
-document.getElementById("sel-year").value="2025";
-document.getElementById("sel-type").value="q4";
+// Year options are hardcoded in HTML (2026, 2025, 2024)
+// Just set period to Full Year and render
+document.getElementById("sel-type").value="full_year";
 render();
 </script>
 </body>
