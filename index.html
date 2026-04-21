@@ -311,7 +311,7 @@ async function fetchTab(tab){
       return[];
     }
     const h=rows[0];
-    const res=rows.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=(row[i]||"").trim();return o;});
+    const res=rows.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=(row[i]||"").trim());return o;});
     cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);
     console.log("CSV OK: "+tab+" ("+res.length+" rows)");
     return res;
@@ -457,7 +457,7 @@ function renderChannels(rows){
 }
 
 // ── CUSTOMERS ─────────────────────────────────────────────────────
-function segBadge(s){const new_=s==="New";return `<span style="font-size:9px;padding:1px 6px;border-radius:20px;background:${new_?"var(--A-bg)":"var(--B-bg)"};color:${new_?"var(--A)":"var(--B)";border:.5px solid ${new_?"var(--A-bd)":"var(--B-bd)"}}">${s||"—"}</span>`}
+function segBadge(s){const new_=s==="New";return `<span style="font-size:9px;padding:1px 6px;border-radius:20px;background:${new_?"var(--A-bg)":"var(--B-bg)"};color:${new_?"var(--A)":"var(--B)"};border:.5px solid ${new_?"var(--A-bd)":"var(--B-bd)"}}">${s||"—"}</span>`}
 function renderCustomers(rows){
   const el=$("tbl-customers");
   if(!rows.length){el.innerHTML=`<div class="empty">No data.</div>`;return;}
