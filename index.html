@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Pareto Analysis — Equestrian Labs</title>
+<!-- CHANGED: title updated -->
+<title>Pareto Sales Analysis — Equestrian Labs</title>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -14,6 +15,7 @@
   --B:#7D5E0E;--B-bg:#FEF3D2;--B-bd:rgba(125,94,14,.18);
   --C:#8E3828;--C-bg:#FAE2DC;--C-bd:rgba(142,56,40,.18);
   --bar-a:#0C7050;--bar-b:#D8B054;--bar-c:#D85A30;
+  --acc-gs:#1450A8;--acc-gp:#0C7050;
 }
 [data-theme="dark"]{
   --bg:#0A0A09;--sf:#141412;--sf2:#1C1C1A;--sf3:#242422;
@@ -22,14 +24,16 @@
   --B:#D8B054;--B-bg:#2A2008;--B-bd:rgba(216,176,84,.2);
   --C:#F06868;--C-bg:#300808;--C-bd:rgba(240,104,104,.2);
   --bar-a:#2EE896;--bar-b:#D8B054;--bar-c:#F06868;
+  --acc-gs:#72AEFF;--acc-gp:#2EE896;
 }
 html,body{min-height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);font-size:14px}
-.wrap{max-width:1200px;margin:0 auto;padding:24px 20px 60px}
+.wrap{max-width:1280px;margin:0 auto;padding:24px 20px 60px}
 .top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
 .brand-row{display:flex;align-items:flex-start;gap:8px}
 .brand-dot{width:8px;height:8px;border-radius:50%;background:var(--A);margin-top:3px;flex-shrink:0}
 .brand-name{font-family:'Syne',sans-serif;font-size:14px;font-weight:700;letter-spacing:-.02em}
 .brand-sub{font-size:10px;color:var(--tx3);margin-top:1px}
+/* CHANGED: h1 updated */
 h1{font-family:'Syne',sans-serif;font-size:24px;font-weight:800;letter-spacing:-.04em;line-height:1.1;margin-top:10px}
 h1 span{color:var(--A)}
 .period-info{font-size:11px;color:var(--tx3);margin-top:5px}
@@ -37,8 +41,7 @@ h1 span{color:var(--A)}
 .sel-group{display:flex;flex-direction:column;gap:3px}
 .sel-label{font-size:9px;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.08em}
 select.psel{font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;
-  color:#F0EFE8 !important;
-  background:#1C1C1A !important;
+  color:#F0EFE8 !important;background:#1C1C1A !important;
   border:1px solid var(--bd2);border-radius:6px;
   padding:5px 26px 5px 10px;cursor:pointer;outline:none;appearance:none;
   background-image:url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23aaa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
@@ -59,11 +62,15 @@ select.psel option{background:#1C1C1A;color:#F0EFE8}
 .sn{font-size:9px;font-weight:700;color:var(--tx3);letter-spacing:.12em;text-transform:uppercase;font-family:'Syne',sans-serif;white-space:nowrap}
 .sl{flex:1;height:1px;background:var(--bd)}
 .st{font-size:9px;font-weight:600;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
+
+/* ── KPI CARDS ── */
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:20px}
 .card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
 .card-l{font-size:10px;color:var(--tx3);font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
 .card-v{font-family:'Syne',sans-serif;font-size:22px;font-weight:700;letter-spacing:-.03em;line-height:1}
 .card-s{font-size:10px;color:var(--tx3);margin-top:4px}
+
+/* ── PARETO BAR ── */
 .cum-row{display:flex;height:26px;border-radius:7px;overflow:hidden;margin-bottom:9px;border:1px solid var(--bd)}
 .cum-seg{display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;
   color:rgba(255,255,255,.9);transition:width .5s;cursor:default;overflow:hidden;white-space:nowrap}
@@ -73,30 +80,44 @@ select.psel option{background:#1C1C1A;color:#F0EFE8}
 .insight{background:var(--A-bg);border:1px solid var(--A-bd);border-radius:8px;
   padding:13px 16px;margin:14px 0 0;font-size:12px;color:var(--tx2);line-height:1.75}
 .insight strong{color:var(--A)}
+
+/* ── TABLES ── */
 .tbl-wrap{background:var(--sf);border:1px solid var(--bd);border-radius:10px;overflow:hidden}
 .tbl-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--bd)}
 .tbl-title{font-size:12px;font-weight:600;color:var(--tx2)}
 .tbl-note{font-size:10px;color:var(--tx3)}
 table{width:100%;border-collapse:collapse;font-size:12px}
-thead th{padding:7px 12px;text-align:left;font-size:9px;font-weight:700;color:var(--tx3);
+thead th{padding:7px 10px;text-align:left;font-size:9px;font-weight:700;color:var(--tx3);
   letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--bd);background:var(--sf2);white-space:nowrap}
 thead th.r{text-align:right}
+/* CHANGED: column group separators */
+thead th.gs-col{border-left:2px solid var(--acc-gs);color:var(--acc-gs)}
+thead th.gp-col{border-left:2px solid var(--acc-gp);color:var(--acc-gp)}
 tbody tr{border-bottom:1px solid var(--bd);transition:background .1s}
 tbody tr:last-child{border-bottom:none}
 tbody tr:hover{background:var(--sf2)}
-td{padding:8px 12px;color:var(--tx2);vertical-align:middle}
+td{padding:7px 10px;color:var(--tx2);vertical-align:middle}
 td.r{text-align:right;font-family:'DM Mono',monospace;font-size:11px;color:var(--tx)}
-td.name{color:var(--tx);font-weight:500;max-width:220px}
+td.name{color:var(--tx);font-weight:500;max-width:200px}
 td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;margin-top:1px}
+/* CHANGED: GS and GP column separators in tbody */
+td.gs-sep{border-left:2px solid rgba(114,174,255,.2)}
+td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
 .zone{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
   border-radius:5px;font-size:10px;font-weight:700;font-family:'Syne',sans-serif;flex-shrink:0}
 .zA{background:var(--A-bg);color:var(--A);border:1px solid var(--A-bd)}
 .zB{background:var(--B-bg);color:var(--B);border:1px solid var(--B-bd)}
 .zC{background:var(--C-bg);color:var(--C);border:1px solid var(--C-bd)}
-.bar-wrap{display:flex;align-items:center;gap:5px;min-width:100px}
+.bar-wrap{display:flex;align-items:center;gap:5px;min-width:80px}
 .bar-bg{flex:1;height:4px;background:var(--sf3);border-radius:2px;overflow:hidden}
 .bar-fill{height:100%;border-radius:2px;transition:width .4s}
 .bar-pct{font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3);min-width:34px;text-align:right}
+/* CHANGED: dual cumulative badges */
+.cum-badge{display:inline-flex;align-items:center;gap:3px;font-family:'DM Mono',monospace;font-size:10px;padding:1px 6px;border-radius:3px;font-weight:500}
+.cum-gs{background:rgba(114,174,255,.12);color:var(--acc-gs);border:1px solid rgba(114,174,255,.2)}
+.cum-gp{background:rgba(46,232,150,.12);color:var(--acc-gp);border:1px solid rgba(46,232,150,.2)}
+
+/* ── CHANNEL CARDS ── */
 .ch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px}
 .chc{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
 .chc-name{font-size:10px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
@@ -104,6 +125,16 @@ td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;marg
 .chc-sub{font-size:10px;color:var(--tx3);margin-top:2px}
 .chc-bar{height:3px;background:var(--bd2);border-radius:2px;margin-top:9px;overflow:hidden}
 .chc-barf{height:100%;border-radius:2px;transition:width .5s}
+
+/* ── SUMMARY SECTION (Category / Channel / NVR) ── */
+.sum-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:8px}
+.sum-card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
+.sum-label{font-size:10px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px}
+.sum-v{font-family:'Syne',sans-serif;font-size:18px;font-weight:700;letter-spacing:-.02em}
+.sum-sub{font-size:10px;color:var(--tx3);margin-top:3px}
+.sum-gp{font-size:11px;color:var(--A);margin-top:4px;font-weight:600}
+
+/* ── LOADING ── */
 .ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;
   align-items:center;justify-content:center;flex-direction:column;gap:10px;backdrop-filter:blur(4px)}
 .ov.show{display:flex}
@@ -111,7 +142,7 @@ td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;marg
 @keyframes sp{to{transform:rotate(360deg)}}
 .ov-t{font-size:12px;color:var(--tx);background:var(--sf);padding:7px 16px;border-radius:20px;border:1px solid var(--bd2)}
 .empty{padding:28px;text-align:center;font-size:12px;color:var(--tx3)}
-@media(max-width:640px){h1{font-size:20px}.wrap{padding:16px 14px 40px}.cards{grid-template-columns:repeat(2,1fr)}table{font-size:11px}td,thead th{padding:6px 8px}}
+@media(max-width:640px){h1{font-size:20px}.wrap{padding:16px 14px 40px}.cards{grid-template-columns:repeat(2,1fr)}table{font-size:11px}td,thead th{padding:5px 6px}}
 </style>
 </head>
 <body>
@@ -122,9 +153,11 @@ td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;marg
     <div>
       <div class="brand-row">
         <div class="brand-dot"></div>
-        <div><div class="brand-name">Equestrian Labs — Corro</div><div class="brand-sub">Pareto Analysis · Shopify → Sheets</div></div>
+        <!-- CHANGED: subtitle updated -->
+        <div><div class="brand-name">Equestrian Labs — Corro</div><div class="brand-sub">Pareto Sales Analysis · Shopify → Sheets · Gross Profit based</div></div>
       </div>
-      <h1>Revenue <span>Pareto</span></h1>
+      <!-- CHANGED: title is now "Pareto Sales Analysis" -->
+      <h1>Pareto <span>Sales Analysis</span></h1>
       <div class="period-info" id="period-info">—</div>
     </div>
     <div class="controls">
@@ -155,50 +188,69 @@ td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;marg
     </div>
   </div>
 
+  <!-- CHANGED: KPI cards — Gross Sales first, then Net Sales, Products→Units Sold, Zone A→Pareto 80/20 -->
   <div class="cards">
-    <div class="card"><div class="card-l">Net Revenue</div><div class="card-v" id="s-rev">—</div></div>
-    <div class="card"><div class="card-l">Orders</div><div class="card-v" id="s-ord">—</div></div>
-    <div class="card"><div class="card-l">Products</div><div class="card-v" id="s-prod">—</div></div>
-    <div class="card"><div class="card-l">Zone A</div><div class="card-v" id="s-za">—</div><div class="card-s">products = 80% revenue</div></div>
-    <div class="card"><div class="card-l">Top Product</div><div class="card-v" id="s-top1">—</div><div class="card-s" id="s-top1-name">of revenue</div></div>
+    <div class="card"><div class="card-l">Gross Sales</div><div class="card-v" id="s-gs">—</div></div>
+    <div class="card"><div class="card-l">Net Sales</div><div class="card-v" id="s-rev">—</div></div>
+    <div class="card"><div class="card-l">Total Orders</div><div class="card-v" id="s-ord">—</div></div>
+    <!-- CHANGED: Products → Units Sold -->
+    <div class="card"><div class="card-l">Units Sold</div><div class="card-v" id="s-prod">—</div></div>
+    <!-- CHANGED: Zone A → Pareto 80/20, description clarified as Gross Profit based -->
+    <div class="card"><div class="card-l">Pareto 80/20</div><div class="card-v" id="s-za">—</div><div class="card-s" id="s-za-sub">products = 80% Gross Profit</div></div>
+    <div class="card"><div class="card-l">Top Seller</div><div class="card-v" id="s-top1">—</div><div class="card-s" id="s-top1-name">of Gross Sales</div></div>
     <div class="card"><div class="card-l">Updated</div><div class="card-v" style="font-size:13px;margin-top:2px" id="s-upd">—</div></div>
   </div>
 
   <div class="sec"><div class="sn">Overview</div><div class="sl"></div><div class="st">Cumulative revenue by zone</div></div>
   <div class="cum-row" id="cum-bar"></div>
   <div class="legend">
-    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-a)"></div>Zone A — 80% of revenue</div>
+    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-a)"></div>Zone A — 80% of Gross Profit (Top Sellers)</div>
     <div class="leg-item"><div class="leg-dot" style="background:var(--bar-b)"></div>Zone B — 80–95%</div>
     <div class="leg-item"><div class="leg-dot" style="background:var(--bar-c)"></div>Zone C — tail</div>
   </div>
   <div class="insight" id="insight">Select a year and period above.</div>
 
+  <!-- CHANGED: section title updated, "By Product" label updated -->
   <div class="sec"><div class="sn">01</div><div class="sl"></div><div class="st">By Product — all variants of same product grouped together</div></div>
   <div class="tbl-wrap">
-    <div class="tbl-head"><div class="tbl-title">Top Products by Net Revenue</div><div class="tbl-note" id="prod-note">—</div></div>
+    <!-- CHANGED: title "Top Products by Net Sales" (was Net Revenue) -->
+    <div class="tbl-head">
+      <div class="tbl-title">Top Products by Net Sales</div>
+      <!-- CHANGED: note shows "Pareto Products" count -->
+      <div class="tbl-note" id="prod-note">—</div>
+    </div>
     <div id="tbl-products"><div class="empty">Select a period above</div></div>
   </div>
 
-  <div class="sec"><div class="sn">02</div><div class="sl"></div><div class="st">By Category / Shopify Collection</div></div>
-  <div class="tbl-wrap">
-    <div class="tbl-head"><div class="tbl-title">Revenue by Category</div><div class="tbl-note">Main collection — not subcategory</div></div>
+  <!-- CHANGED: new section — Summary by Category -->
+  <div class="sec"><div class="sn">02</div><div class="sl"></div><div class="st">Summary by Category / Type</div></div>
+  <div id="cat-summary"><div class="empty">Loading...</div></div>
+  <div class="tbl-wrap" style="margin-top:8px">
+    <div class="tbl-head">
+      <div class="tbl-title">Revenue by Category</div>
+      <div class="tbl-note">Main Shopify collection — Uncategorized = needs tagging</div>
+    </div>
     <div id="tbl-categories"><div class="empty">Select a period above</div></div>
   </div>
 
-  <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">By Sales Channel</div></div>
-  <div class="ch-grid" id="ch-grid"></div>
+  <!-- CHANGED: new section — Summary by Sales Channel -->
+  <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">Summary by Sales Channel</div></div>
+  <div id="ch-summary"><div class="empty">Loading...</div></div>
+  <div class="ch-grid" style="margin-top:8px" id="ch-grid"></div>
 
-  <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">Top Customers</div></div>
+  <!-- CHANGED: new section — New vs Returning summary -->
+  <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">New vs Returning customers — revenue summary</div></div>
+  <div id="nvr-panel"></div>
+
+  <!-- Top Customers -->
+  <div class="sec"><div class="sn">05</div><div class="sl"></div><div class="st">Top Customers</div></div>
   <div class="tbl-wrap">
-    <div class="tbl-head"><div class="tbl-title">Top 25 Customers by Net Revenue</div><div class="tbl-note">Zone A = strategic accounts</div></div>
+    <div class="tbl-head"><div class="tbl-title">Top 25 Customers by Net Sales</div><div class="tbl-note">Zone A = strategic accounts</div></div>
     <div id="tbl-customers"><div class="empty">Select a period above</div></div>
   </div>
 
-  <div class="sec"><div class="sn">05</div><div class="sl"></div><div class="st">New vs Returning customers — revenue summary</div></div>
-  <div id="nvr-panel"></div>
-
   <div style="margin-top:22px;font-size:10px;color:var(--tx3);text-align:center">
-    Google Sheets ← pareto_v1.py ← Shopify API &nbsp;·&nbsp; <span id="footer-lbl">—</span>
+    Google Sheets ← pareto_v1.py ← Shopify API &nbsp;·&nbsp; Pareto 80/20 based on <strong style="color:var(--A)">Gross Profit</strong> &nbsp;·&nbsp; <span id="footer-lbl">—</span>
   </div>
 </div>
 
@@ -211,12 +263,6 @@ const CY = new Date().getFullYear();
 let cache = {};
 const $ = id => document.getElementById(id);
 
-// ── BUILD YEAR OPTIONS ────────────────────────────────────────────
-function buildYears(){
-  // Years are hardcoded in HTML select — nothing to do here
-}
-
-// ── PERIOD KEY ────────────────────────────────────────────────────
 function getPeriodKey(){
   const y=$("sel-year").value, t=$("sel-type").value;
   return t==="full_year" ? `full_year_${y}` : `${t}_${y}`;
@@ -233,25 +279,18 @@ function fmtN(v){const n=parseInt(v)||0;if(n>=1000)return(n/1000).toFixed(1)+"K"
 function fmtP(v){return(parseFloat(v)||0).toFixed(1)+"%"}
 function zCls(z){return z==="A"?"zA":z==="B"?"zB":"zC"}
 function zClr(z){return z==="A"?"var(--bar-a)":z==="B"?"var(--bar-b)":"var(--bar-c)"}
+function gpClr(gp){const n=parseFloat(gp)||0;return n<0?"var(--C)":n<20?"var(--B)":"var(--A)"}
 
 // ── FETCH ─────────────────────────────────────────────────────────
 function parseCSV(text){
-  // Robust CSV parser that handles quoted fields with commas/newlines
-  const rows=[];
-  let row=[],field="",inQ=false;
+  const rows=[];let row=[],field="",inQ=false;
   for(let i=0;i<text.length;i++){
     const c=text[i],nc=text[i+1];
-    if(inQ){
-      if(c==='"'&&nc==='"'){field+='"';i++;}
-      else if(c==='"'){inQ=false;}
-      else{field+=c;}
-    } else {
-      if(c==='"'){inQ=true;}
-      else if(c===','){row.push(field);field="";}
+    if(inQ){if(c==='"'&&nc==='"'){field+='"';i++;}else if(c==='"'){inQ=false;}else{field+=c;}}
+    else{if(c==='"'){inQ=true;}else if(c===','){row.push(field);field="";}
       else if(c==='\r'&&nc==='\n'){row.push(field);rows.push(row);row=[];field="";i++;}
       else if(c==='\n'||c==='\r'){row.push(field);rows.push(row);row=[];field="";}
-      else{field+=c;}
-    }
+      else{field+=c;}}
   }
   if(field||row.length){row.push(field);rows.push(row);}
   return rows.filter(r=>r.some(c=>c.trim()!==""));
@@ -259,16 +298,6 @@ function parseCSV(text){
 
 async function fetchTab(tab){
   if(cache[tab]) return cache[tab];
-  // Use CSV export — works with any "Anyone with link can view" Sheet
-  // No API key needed, no domain restrictions
-  const GID_MAP={
-    "pareto_products":   null,
-    "pareto_categories": null,
-    "pareto_channels":   null,
-    "pareto_customers":  null,
-    "pareto_new_vs_ret": null,
-  };
-  // First try: Sheets API with key (works if key has no domain restrictions)
   const apiUrl=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tab)}?key=${AKEY}`;
   try{
     const r=await fetch(apiUrl);
@@ -277,78 +306,41 @@ async function fetchTab(tab){
       if(!d.error&&d.values&&d.values.length>=2){
         const h=d.values[0];
         const res=d.values.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=row[i]||"");return o;});
-        cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);
-        console.log("API OK: "+tab+" ("+res.length+" rows)");
-        return res;
+        cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);return res;
       }
     }
-    console.warn("API failed for "+tab+" ("+r.status+"), trying CSV export...");
-  }catch(e){
-    console.warn("API error for "+tab+": "+e.message+", trying CSV export...");
-  }
-
-  // Fallback: CSV export URL — always works with public Sheets, no API key
+  }catch(e){console.warn(e);}
   const csvUrl=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}`;
   try{
-    const r=await fetch(csvUrl);
-    if(!r.ok){
-      showError(`Cannot load tab "${tab}" (HTTP ${r.status}). Make sure the Sheet is shared as "Anyone with the link can view".`);
-      return[];
-    }
-    const text=await r.text();
-    if(!text||text.trim()===""){
-      showError(`Tab "${tab}" is empty. Run the pipeline first.`);
-      return[];
-    }
-    // Check if we got an error page instead of CSV
-    if(text.includes("<html")||text.includes("<!DOCTYPE")){
-      showError(`Tab "${tab}": Sheet is not publicly accessible. Go to Share → "Anyone with the link" → Viewer.`);
-      return[];
-    }
-    const rows=parseCSV(text);
-    if(rows.length<2){
-      showError(`Tab "${tab}" has no data rows. Run the pipeline first.`);
-      return[];
-    }
+    const r=await fetch(csvUrl);if(!r.ok)return[];
+    const text=await r.text();if(!text||text.includes("<html"))return[];
+    const rows=parseCSV(text);if(rows.length<2)return[];
     const h=rows[0];
     const res=rows.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=(row[i]||"").trim());return o;});
-    cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);
-    console.log("CSV OK: "+tab+" ("+res.length+" rows)");
-    return res;
-  }catch(e){
-    showError(`Error loading "${tab}": ${e.message}`);
-    console.error(tab,e);
-    return[];
-  }
+    cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);return res;
+  }catch(e){console.error(tab,e);return[];}
 }
 
-function showError(msg){
-  let box=document.getElementById("err-box");
-  if(!box){
-    box=document.createElement("div");
-    box.id="err-box";
-    box.style.cssText="background:#300808;border:1px solid #F06868;border-radius:8px;padding:12px 16px;margin:10px 0;font-size:12px;color:#F06868;font-family:monospace;white-space:pre-wrap;";
-    const wrap=document.querySelector(".wrap");
-    const h1=wrap.querySelector("h1");
-    h1.parentNode.insertBefore(box,h1.nextSibling);
-  }
-  box.textContent=(box.textContent?box.textContent+"\n":"")+msg;
-}
 function byPeriod(rows,pk){return rows.filter(r=>(r.period||"").trim()===pk).sort((a,b)=>parseInt(a.rank)-parseInt(b.rank))}
 
-// ── SUMMARY ───────────────────────────────────────────────────────
+// ── SUMMARY KPIs ──────────────────────────────────────────────────
 function renderSummary(fp){
-  if(!fp.length){["s-rev","s-ord","s-prod","s-za","s-top1"].forEach(id=>$(id).textContent="—");return;}
-  const total=fp.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
-  const orders=fp.reduce((a,r)=>a+parseInt(r.orders||0),0);
-  const za=fp.filter(r=>r.pareto_zone==="A").length;
-  $("s-rev").textContent=fmt$(total);
-  $("s-ord").textContent=fmtN(orders);
-  $("s-prod").textContent=fp.length;
-  $("s-za").textContent=za;
-  $("s-top1").textContent=fmtP(fp[0]?.pct_revenue||0);
-  $("s-top1-name").textContent=(fp[0]?.product_title||"").split(" ").slice(0,5).join(" ");
-  $("s-upd").textContent=(fp[0]?.updated_at||"").slice(0,10)||"—";
+  if(!fp.length){["s-gs","s-rev","s-ord","s-prod","s-za","s-top1"].forEach(id=>$(id).textContent="—");return;}
+  // CHANGED: compute gross_sales sum + net_sales sum + units sold
+  const totalGS  = fp.reduce((a,r)=>a+parseFloat(r.gross_sales||0),0);
+  const totalNS  = fp.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const totalOrd = fp.reduce((a,r)=>a+parseInt(r.orders||0),0);
+  const totalUnits = fp.reduce((a,r)=>a+parseInt(r.units||0),0);
+  // CHANGED: Zone A now based on Gross Profit cumulative (cum_gp_pct if available, else fallback to cum_pct)
+  const za = fp.filter(r=>r.pareto_zone==="A").length;
+  $("s-gs").textContent  = fmt$(totalGS);
+  $("s-rev").textContent = fmt$(totalNS);
+  $("s-ord").textContent = fmtN(totalOrd);
+  $("s-prod").textContent = fmtN(totalUnits);   // CHANGED: was product count, now units sold
+  $("s-za").textContent  = za;
+  $("s-top1").textContent = fmtP(fp[0]?.pct_revenue||0);
+  $("s-top1-name").textContent = (fp[0]?.product_title||"").split(" ").slice(0,5).join(" ");
+  $("s-upd").textContent = (fp[0]?.updated_at||"").slice(0,10)||"—";
 }
 
 // ── PARETO BAR ────────────────────────────────────────────────────
@@ -372,79 +364,150 @@ function renderInsight(fp,fc,fh,label){
   if(!fp.length){$("insight").textContent="No data found. Run pareto_v1.py with this period first.";return;}
   const za=fp.filter(r=>r.pareto_zone==="A");
   const zaRev=za.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const zaGP =za.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0);
   const top3=fp.slice(0,3).map(r=>`<strong>${(r.product_title||"").split(" ").slice(0,4).join(" ")}</strong>`).join(", ");
   $("insight").innerHTML=`In <strong>${label}</strong>: <strong>${za.length} product${za.length!==1?"s":""}</strong> of ${fp.length} total
-    generate <strong>80% of revenue</strong> (${fmt$(zaRev)}).
+    generate <strong>80% of Gross Profit</strong> (${fmt$(zaGP)} GP · ${fmt$(zaRev)} Net Sales).
     Top sellers: ${top3}.
     ${fc[0]?` &nbsp;·&nbsp; Leading category: <strong>${fc[0].category}</strong> (${fmtP(fc[0].pct_revenue)}).`:""}
     ${fh[0]?` &nbsp;·&nbsp; Top channel: <strong>${fh[0].channel}</strong> (${fmtP(fh[0].pct_revenue)}).`:""}
-    <br><em style="color:var(--tx3);font-size:11px">Zone A products are your strategic levers — focus investment here first.</em>`;
+    <br><em style="color:var(--tx3);font-size:11px">Pareto 80/20 = Zone A products ranked by Net Sales · Gross Profit is the priority metric.</em>`;
 }
 
-// ── PRODUCTS ──────────────────────────────────────────────────────
-function gpClr(gp){const n=parseFloat(gp)||0;return n<0?"var(--C)":n<20?"var(--B)":"var(--A)"}
+// ── PRODUCTS TABLE ────────────────────────────────────────────────
+// CHANGES:
+//  - Removed COGS column
+//  - Added % Gross Sales column
+//  - Added Cumulative GS column (blue)
+//  - Added Cumulative GP column (green)
+//  - Both accumulatives shown with colored badges
+//  - Title: "Pareto Products" count in note
 function renderProducts(rows){
   const el=$("tbl-products");
-  const hasCogs=rows.some(r=>parseFloat(r.cogs||0)>0);
-  $("prod-note").textContent=rows.length?`${rows.length} products — variants grouped · ${hasCogs?"COGS loaded":"no COGS — set Cost per item in Shopify Admin"}`:"No data";
-  if(!rows.length){el.innerHTML=`<div class="empty">No data. Run: python pareto_v1.py --only ${getPeriodKey()}</div>`;return;}
+  const pk=getPeriodKey();
+  const zaCount=rows.filter(r=>r.pareto_zone==="A").length;
+  // CHANGED: note shows "Pareto Products" label
+  $("prod-note").textContent=rows.length?`${rows.length} Pareto Products — variants grouped · ${zaCount} in Zone A (80% Gross Profit)`:"No data";
+  if(!rows.length){el.innerHTML=`<div class="empty">No data. Run: python pareto_v1.py --only ${pk}</div>`;return;}
+
+  const totalGS = rows.reduce((a,r)=>a+parseFloat(r.gross_sales||0),0);
+  const totalGP = rows.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0);
+  let cumGS=0, cumGP=0;
+
   const show=rows.slice(0,50);
   el.innerHTML=`<table><thead><tr>
     <th>#</th><th>Zone</th><th>Product</th><th>Type</th>
-    <th class="r">Gross Sales</th><th class="r">Net Sales</th>
-    <th class="r">COGS</th><th class="r">Gross Profit</th><th class="r">GP%</th>
-    <th class="r">% Revenue</th><th class="r">Cumulative</th>
+    <th class="r gs-col">Gross Sales</th>
+    <th class="r gs-col">% GS</th>
+    <th class="r gs-col">Cum. GS</th>
+    <th class="r gp-col">Gross Profit</th>
+    <th class="r gp-col">GP%</th>
+    <th class="r gp-col">Cum. GP</th>
+    <th class="r">Net Sales</th>
     <th class="r">Units</th><th class="r">Orders</th><th>Top Channel</th>
-  </tr></thead><tbody>${show.map(r=>`<tr>
-    <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
-    <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
-    <td class="name">${r.product_title||"—"}<small>${r.sku_parent||r.vendor||""}</small></td>
-    <td style="font-size:10px;color:var(--tx3)">${r.product_type||"—"}</td>
-    <td class="r">${fmt$(r.gross_sales)}</td>
-    <td class="r">${fmt$(r.net_sales)}</td>
-    <td class="r" style="color:var(--tx3)">${fmt$(r.cogs)}</td>
-    <td class="r" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
-    <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
-    <td class="r"><div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${zClr(r.pareto_zone)}"></div></div><span class="bar-pct">${fmtP(r.pct_revenue)}</span></div></td>
-    <td class="r" style="font-family:'DM Mono',monospace;font-size:11px">${fmtP(r.cum_pct)}</td>
-    <td class="r">${fmtN(r.units)}</td>
-    <td class="r">${fmtN(r.orders)}</td>
-    <td style="font-size:10px;color:var(--tx3)">${r.top_channel||"—"}</td>
-  </tr>`).join("")}</tbody></table>
-  ${rows.length>50?`<div style="padding:9px 14px;font-size:10px;color:var(--tx3)">Top 50 of ${rows.length}. Full list in Google Sheets pareto_products tab.</div>`:""}`;
+  </tr></thead><tbody>${show.map(r=>{
+    cumGS += parseFloat(r.gross_sales||0);
+    cumGP += parseFloat(r.gross_profit||0);
+    const pctGS   = totalGS>0 ? ((parseFloat(r.gross_sales||0)/totalGS)*100).toFixed(1) : "0.0";
+    const cumGSpct = totalGS>0 ? ((cumGS/totalGS)*100).toFixed(1) : "0.0";
+    const cumGPpct = totalGP>0 ? ((cumGP/totalGP)*100).toFixed(1) : "0.0";
+    return `<tr>
+      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
+      <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
+      <td class="name">${r.product_title||"—"}<small>${r.product_type||""}</small></td>
+      <td style="font-size:10px;color:var(--tx3)">${r.product_type||"—"}</td>
+      <td class="r gs-sep">${fmt$(r.gross_sales)}</td>
+      <td class="r" style="color:var(--acc-gs);font-family:'DM Mono',monospace">${pctGS}%</td>
+      <td class="r"><span class="cum-badge cum-gs">${cumGSpct}%</span></td>
+      <td class="r gp-sep" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
+      <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
+      <td class="r"><span class="cum-badge cum-gp">${cumGPpct}%</span></td>
+      <td class="r">${fmt$(r.net_sales)}</td>
+      <td class="r">${fmtN(r.units)}</td>
+      <td class="r">${fmtN(r.orders)}</td>
+      <td style="font-size:10px;color:var(--tx3)">${r.top_channel||"—"}</td>
+    </tr>`;
+  }).join("")}</tbody></table>
+  ${rows.length>50?`<div style="padding:9px 14px;font-size:10px;color:var(--tx3)">Showing top 50 of ${rows.length} Pareto Products. Full list in Google Sheets.</div>`:""}`;
 }
 
-// ── CATEGORIES ────────────────────────────────────────────────────
+// ── CATEGORY SUMMARY CARDS + TABLE ───────────────────────────────
+// CHANGED: new section with summary cards per category, then full table
+function renderCategorySummary(rows){
+  const sumEl=$("cat-summary");
+  if(!rows.length){sumEl.innerHTML="";return;}
+  const totalGS=rows.reduce((a,r)=>a+parseFloat(r.gross_sales||0),0)||1;
+  const totalGP=rows.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0)||1;
+  sumEl.innerHTML=`<div class="sum-grid">${rows.slice(0,8).map(r=>{
+    const pctGS=((parseFloat(r.gross_sales||0)/totalGS)*100).toFixed(1);
+    const pctGP=((parseFloat(r.gross_profit||0)/totalGP)*100).toFixed(1);
+    const isUncat=(r.category||"").toLowerCase().includes("uncat");
+    return `<div class="sum-card" style="${isUncat?'border-color:var(--B);':''}">
+      <div class="sum-label" style="${isUncat?'color:var(--B)':''}">
+        ${r.category||"Uncategorized"}${isUncat?' ⚠':''}</div>
+      <div class="sum-v">${fmt$(r.gross_sales)}</div>
+      <div class="sum-sub">${pctGS}% of Gross Sales · ${fmtN(r.units)} units</div>
+      <div class="sum-gp">GP: ${fmt$(r.gross_profit)} (${pctGP}% of total GP)</div>
+    </div>`;
+  }).join("")}</div>`;
+}
+
 function renderCategories(rows){
+  renderCategorySummary(rows);
   const el=$("tbl-categories");
   if(!rows.length){el.innerHTML=`<div class="empty">No data.</div>`;return;}
+  const totalGS=rows.reduce((a,r)=>a+parseFloat(r.gross_sales||0),0)||1;
+  const totalGP=rows.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0)||1;
+  let cumGS=0,cumGP=0;
   el.innerHTML=`<table><thead><tr>
     <th>#</th><th>Zone</th><th>Category / Collection</th>
-    <th class="r">Gross Sales</th><th class="r">Net Sales</th>
-    <th class="r">COGS</th><th class="r">Gross Profit</th><th class="r">GP%</th>
-    <th class="r">% Revenue</th><th class="r">Cumulative</th>
+    <th class="r gs-col">Gross Sales</th>
+    <th class="r gs-col">% GS</th>
+    <th class="r gs-col">Cum. GS</th>
+    <th class="r gp-col">Gross Profit</th>
+    <th class="r gp-col">GP%</th>
+    <th class="r gp-col">Cum. GP</th>
+    <th class="r">Net Sales</th>
     <th class="r">Units</th><th class="r">Orders</th>
-  </tr></thead><tbody>${rows.map(r=>`<tr>
-    <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
-    <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
-    <td class="name">${r.category||"Uncategorized"}</td>
-    <td class="r">${fmt$(r.gross_sales)}</td>
-    <td class="r">${fmt$(r.net_sales)}</td>
-    <td class="r" style="color:var(--tx3)">${fmt$(r.cogs)}</td>
-    <td class="r" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
-    <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
-    <td class="r"><div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${zClr(r.pareto_zone)}"></div></div><span class="bar-pct">${fmtP(r.pct_revenue)}</span></div></td>
-    <td class="r" style="font-family:'DM Mono',monospace;font-size:11px">${fmtP(r.cum_pct)}</td>
-    <td class="r">${fmtN(r.units)}</td>
-    <td class="r">${fmtN(r.orders)}</td>
-  </tr>`).join("")}</tbody></table>`;
+  </tr></thead><tbody>${rows.map(r=>{
+    cumGS+=parseFloat(r.gross_sales||0);
+    cumGP+=parseFloat(r.gross_profit||0);
+    const pctGS  =((parseFloat(r.gross_sales||0)/totalGS)*100).toFixed(1);
+    const cumGSpct=((cumGS/totalGS)*100).toFixed(1);
+    const cumGPpct=((cumGP/totalGP)*100).toFixed(1);
+    const isUncat=(r.category||"").toLowerCase().includes("uncat");
+    return `<tr>
+      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
+      <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
+      <td class="name" style="${isUncat?'color:var(--B)':''}">${r.category||"Uncategorized"}${isUncat?' <span style="font-size:9px;color:var(--B)">← categorize</span>':''}</td>
+      <td class="r gs-sep">${fmt$(r.gross_sales)}</td>
+      <td class="r" style="color:var(--acc-gs);font-family:'DM Mono',monospace">${pctGS}%</td>
+      <td class="r"><span class="cum-badge cum-gs">${cumGSpct}%</span></td>
+      <td class="r gp-sep" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
+      <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
+      <td class="r"><span class="cum-badge cum-gp">${cumGPpct}%</span></td>
+      <td class="r">${fmt$(r.net_sales)}</td>
+      <td class="r">${fmtN(r.units)}</td>
+      <td class="r">${fmtN(r.orders)}</td>
+    </tr>`;
+  }).join("")}</tbody></table>`;
 }
 
-// ── CHANNELS ──────────────────────────────────────────────────────
+// ── CHANNEL SUMMARY + CARDS ───────────────────────────────────────
+// CHANGED: new summary cards above the channel cards
 const CH_COLORS={"Wellington (POS)":"#D8B054","Concierge":"#A090FF","Online (Ecom)":"#72AEFF","Others":"#888"};
 function renderChannels(rows){
+  const sumEl=$("ch-summary");
   const el=$("ch-grid");el.innerHTML="";
-  if(!rows.length){el.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
+  if(!rows.length){sumEl.innerHTML="";el.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
+  const totalGS=rows.reduce((a,r)=>a+parseFloat(r.gross_sales||0),0)||1;
+  sumEl.innerHTML=`<div class="sum-grid">${rows.map(r=>{
+    const c=CH_COLORS[r.channel]||"#888";
+    const pctGS=((parseFloat(r.gross_sales||0)/totalGS)*100).toFixed(1);
+    return `<div class="sum-card"><div class="sum-label" style="color:${c}">${r.channel}</div>
+      <div class="sum-v" style="color:${c}">${fmt$(r.net_sales)}</div>
+      <div class="sum-sub">${pctGS}% of Gross Sales · ${fmtN(r.orders)} orders</div></div>`;
+  }).join("")}</div>`;
   rows.forEach(r=>{
     const c=CH_COLORS[r.channel]||"#888";
     const d=document.createElement("div");d.className="chc";
@@ -456,8 +519,25 @@ function renderChannels(rows){
   });
 }
 
-// ── CUSTOMERS ─────────────────────────────────────────────────────
-function segBadge(s){const new_=s==="New";return `<span style="font-size:9px;padding:1px 6px;border-radius:20px;background:${new_?"var(--A-bg)":"var(--B-bg)"};color:${new_?"var(--A)":"var(--B)"};border:.5px solid ${new_?"var(--A-bd)":"var(--B-bd)"}}">${s||"—"}</span>`}
+// ── NEW VS RETURNING ──────────────────────────────────────────────
+function renderNVR(rows){
+  const el=$("nvr-panel");if(!el)return;
+  if(!rows.length){el.innerHTML=`<div class="empty" style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px">No data. Run pipeline first.</div>`;return;}
+  el.innerHTML=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px">${rows.map(r=>{
+    const isNew=(r.segment||"").toLowerCase()==="new";
+    const clr=isNew?"var(--A)":"var(--B)";
+    return `<div style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px;padding:14px 16px">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);margin-bottom:6px">${r.segment} Customers</div>
+      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;color:${clr}">${fmt$(r.net_sales)}</div>
+      <div style="font-size:11px;color:var(--tx3);margin-top:3px">${fmtP(r.pct_revenue)} of revenue &nbsp;·&nbsp; ${fmtN(r.customers)} customers &nbsp;·&nbsp; ${fmtN(r.orders)} orders</div>
+      <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:10px;overflow:hidden">
+        <div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${clr}"></div>
+      </div></div>`;
+  }).join("")}</div>`;
+}
+
+// ── CUSTOMERS TABLE ───────────────────────────────────────────────
+function segBadge(s){const new_=s==="New";return `<span style="font-size:9px;padding:1px 6px;border-radius:20px;background:${new_?"var(--A-bg)":"var(--B-bg)"};color:${new_?"var(--A)":"var(--B)"};border:.5px solid ${new_?"var(--A-bd)":"var(--B-bd)"}">${s||"—"}</span>`}
 function renderCustomers(rows){
   const el=$("tbl-customers");
   if(!rows.length){el.innerHTML=`<div class="empty">No data.</div>`;return;}
@@ -472,46 +552,15 @@ function renderCustomers(rows){
     <td>${segBadge(r.segment)}</td>
     <td class="r">${fmt$(r.net_sales)}</td>
     <td class="r"><div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${zClr(r.pareto_zone)}"></div></div><span class="bar-pct">${fmtP(r.pct_revenue)}</span></div></td>
-    <td class="r" style="font-family:'DM Mono',monospace;font-size:11px">${fmtP(r.cum_pct)}</td>
+    <td class="r" style="font-family:'DM Mono',monospace">${fmtP(r.cum_pct)}</td>
     <td class="r">${r.orders}</td>
     <td class="r">${fmtN(r.units)}</td>
     <td style="font-size:10px;color:var(--tx3)">${r.last_order||"—"}</td>
   </tr>`).join("")}</tbody></table>`;
 }
 
-// ── MAIN ─────────────────────────────────────────────────────────
-function renderNVR(rows){
-  const el=$("nvr-panel"); if(!el)return;
-  if(!rows.length){el.innerHTML=`<div class="empty" style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px">No data. Run pipeline first.</div>`;return;}
-  const total_rev=rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
-  el.innerHTML=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px">${rows.map(r=>{
-    const isNew=(r.segment||"").toLowerCase()==="new";
-    const clr=isNew?"var(--A)":"var(--B)";
-    const bg=isNew?"var(--A-bg)":"var(--B-bg)";
-    const bd=isNew?"var(--A-bd)":"var(--B-bd)";
-    return `<div style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px;padding:14px 16px">
-      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);margin-bottom:6px">${r.segment} Customers</div>
-      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;color:${clr}">${fmt$(r.net_sales)}</div>
-      <div style="font-size:11px;color:var(--tx3);margin-top:3px">${fmtP(r.pct_revenue)} of period revenue &nbsp;·&nbsp; ${fmtN(r.customers)} customers &nbsp;·&nbsp; ${fmtN(r.orders)} orders</div>
-      <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:10px;overflow:hidden"><div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${clr}"></div></div>
-    </div>`;
-  }).join("")}</div>`;
-}
-
+// ── MAIN RENDER ───────────────────────────────────────────────────
 async function render(){
-  const eb=document.getElementById("err-box");
-  if(eb) eb.textContent="";
-
-  const selY=$("sel-year");
-  const yr=selY.value;
-  console.log("render() called — year="+yr+" options="+selY.options.length+" SHEET_ID="+SHEET_ID.slice(0,8)+"...");
-
-  if(!yr){
-    showError("Year selector empty ("+selY.options.length+" options). Retrying in 500ms...");
-    setTimeout(()=>{buildYears();render();},500);
-    return;
-  }
-
   const pk=getPeriodKey(), label=getPeriodLabel();
   $("ov").classList.add("show");
   $("ov-t").textContent=`Loading ${label}...`;
@@ -537,8 +586,8 @@ async function render(){
   renderProducts(fp);
   renderCategories(fc);
   renderChannels(fh);
-  renderCustomers(fcu);
   renderNVR(fnvr);
+  renderCustomers(fcu);
 
   $("ov").classList.remove("show");
 }
@@ -550,8 +599,6 @@ function toggleTheme(){
   document.querySelector(".tbtn").textContent=dk?"☀":"☾";
 }
 
-// Year options are hardcoded in HTML (2026, 2025, 2024)
-// Just set period to Full Year and render
 document.getElementById("sel-type").value="full_year";
 render();
 </script>
