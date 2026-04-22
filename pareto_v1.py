@@ -1,18 +1,23 @@
 """
-PARETO PIPELINE v1 — Equestrian Labs / Corro
-=============================================
-Writes 5 tabs to the PARETO Google Sheet (separate from dashboard sheet):
-  pareto_products   – by parent product (all variants grouped)
-  pareto_categories – by Shopify collection (main category)
-  pareto_channels   – by sales channel
-  pareto_customers  – top customers ranked
-  pareto_new_vs_ret – New vs Returning summary
+PARETO PIPELINE v1.1 — Equestrian Labs / Corro
+===============================================
+Cambios v1.1 vs v1.0:
+- FIXED: duplicación de órdenes. fetch_orders usaba financial_status como
+  lista separada por comas — Shopify REST no soporta eso directamente,
+  hacía múltiples requests y duplicaba. Ahora usa dos requests (paid/refunded)
+  y deduplica por order id. Esperado ~8,800 ordenes en 2025 (no 18.2K).
+- CHANGED: Pareto Zone A ahora se basa en Gross Profit (cum_gp_pct ≤ 80%)
+  en lugar de Net Sales. Así los 403 productos que producen el 80% del GP
+  se marcan como Zone A.
+- ADDED: columna cum_gp_pct (acumulado de Gross Profit %) en pareto_products
+  y pareto_categories.
+- ADDED: columna cum_gs_pct (acumulado de Gross Sales %) — el frontend
+  necesita ambos acumulados.
+- NOTE: los productos se siguen ORDENANDO por net_sales (descendente),
+  pero la zona se asigna por GP acumulado. Esto es lo que pidió Ceci:
+  "ordenarlo por Net Sales para llegar al 80% del Gross Profit."
 
-Concierge detection confirmed from tag audit (Q4 2025, 326 orders):
-  Tags: 'concierge, LH' | 'Concierge, DG' | 'Concierge, JS' | 'concierge, JW'
-  Both lowercase and capitalized exist → .lower() handles both correctly
-
-Run modes:
+Run modes (sin cambios):
   python pareto_v1.py                     # all periods 2024 → today
   python pareto_v1.py --only q4_2025     # single quarter
   python pareto_v1.py --only full_year_2025
@@ -87,7 +92,7 @@ def shopify_get(endpoint, params):
                 r = requests.get(url, headers=headers, params=params, timeout=60)
             except requests.exceptions.ConnectionError as e:
                 wait = min(2 ** attempt, 60)
-                print(f"    connection error — retrying in {wait}s (attempt {attempt+1}/8): {e}")
+                print(f"    connection error — retrying in {wait}s: {e}")
                 time.sleep(wait)
                 continue
             if r.status_code == 429:
@@ -97,13 +102,12 @@ def shopify_get(endpoint, params):
                 continue
             if r.status_code in (502, 503, 504):
                 wait = min(2 ** attempt, 60)
-                print(f"    {r.status_code} gateway error — retrying in {wait}s (attempt {attempt+1}/8)...")
+                print(f"    {r.status_code} — retrying in {wait}s...")
                 time.sleep(wait)
                 continue
             r.raise_for_status()
             break
         else:
-            # All 8 attempts exhausted — raise the last response's error
             r.raise_for_status()
         data = r.json()
         key = [k for k in data if k != "errors"][0]
@@ -113,21 +117,44 @@ def shopify_get(endpoint, params):
             for part in link.split(","):
                 if 'rel="next"' in part:
                     url = part.split(";")[0].strip().strip("<>")
-        time.sleep(0.3)  # 3 req/sec steady state stays under burst limit
+        time.sleep(0.3)
     return results
 
+# ── FIX v1.1: fetch_orders sin duplicación ────────────────────────
 def fetch_orders(start, end):
-    print(f"  Fetching orders {start} → {end}...")
-    orders = shopify_get("orders.json", {
-        "status": "any",
-        "financial_status": "paid,partially_paid,partially_refunded,refunded",
-        "created_at_min": f"{start}T00:00:00-05:00",
-        "created_at_max": f"{end}T23:59:59-05:00",
-        "limit": 250,
-        "fields": "id,name,created_at,subtotal_price,total_discounts,source_name,tags,line_items,customer",
-    })
-    print(f"  → {len(orders)} orders")
-    return orders
+    """
+    FIXED v1.1: La versión anterior pasaba financial_status como lista
+    separada por comas en un solo parámetro. Shopify REST acepta eso en
+    algunos endpoints pero con paginación puede duplicar. Ahora hacemos
+    DOS requests separados (paid+partially_paid y partially_refunded+refunded)
+    y deduplicamos por order id.
+
+    Resultado esperado: ~8,800 órdenes en 2025 (la mitad de los 18.2K anteriores).
+    """
+    print(f"  Fetching orders {start} → {end} (deduplication fix v1.1)...")
+
+    seen_ids = set()
+    all_orders = []
+
+    # Batch 1: paid + partially_paid
+    for status in ["paid,partially_paid", "partially_refunded,refunded"]:
+        batch = shopify_get("orders.json", {
+            "status": "any",
+            "financial_status": status,
+            "created_at_min": f"{start}T00:00:00-05:00",
+            "created_at_max": f"{end}T23:59:59-05:00",
+            "limit": 250,
+            "fields": "id,name,created_at,subtotal_price,total_discounts,"
+                      "source_name,tags,line_items,customer",
+        })
+        for o in batch:
+            oid = o.get("id")
+            if oid and oid not in seen_ids:
+                seen_ids.add(oid)
+                all_orders.append(o)
+
+    print(f"  → {len(all_orders)} unique orders (after dedup)")
+    return all_orders
 
 def fetch_products_map():
     print("  Fetching product catalogue...")
@@ -165,11 +192,6 @@ def fetch_cogs_map():
     return variant_cost
 
 def fetch_collections_map():
-    """
-    Build product_id → [collection_title] map.
-    Strategy: paginate ALL collects at once (no per-collection calls)
-    then join with collection titles. Much fewer API calls than 615 individual requests.
-    """
     print("  Fetching collections (titles)...")
     colls = {}
     for c in shopify_get("custom_collections.json", {"limit": 250, "fields": "id,title"}):
@@ -177,27 +199,19 @@ def fetch_collections_map():
     for c in shopify_get("smart_collections.json", {"limit": 250, "fields": "id,title"}):
         colls[str(c["id"])] = c["title"]
     print(f"  → {len(colls)} collection titles loaded")
-
-    # Fetch ALL collects in bulk (paginated) — no per-collection filter
-    # This is O(products) API calls instead of O(collections) calls
-    print("  Fetching all collects (product↔collection memberships)...")
+    print("  Fetching all collects...")
     prod_colls = defaultdict(list)
     all_collects = shopify_get("collects.json", {"limit": 250, "fields": "collection_id,product_id"})
     for co in all_collects:
         cid = str(co.get("collection_id", ""))
         pid = str(co.get("product_id", ""))
         title = colls.get(cid)
-        if title and pid:
-            if title not in prod_colls[pid]:  # avoid duplicates
-                prod_colls[pid].append(title)
+        if title and pid and title not in prod_colls[pid]:
+            prod_colls[pid].append(title)
     print(f"  → {len(prod_colls)} products mapped to collections")
     return prod_colls
 
 # ── CHANNEL DETECTION ─────────────────────────────────────────────
-# Confirmed tags from Q4 2025 audit (326 concierge orders):
-#   'concierge, EliteCartGift, LH' | 'Concierge, DG' | 'Concierge, JS'
-#   'concierge, LH' | 'Concierge, JW' | 'concierge, JW' (via draft order)
-# Both "concierge" and "Concierge" → .lower() handles both
 def detect_channel(order):
     src  = (order.get("source_name") or "").lower().strip()
     tags = (order.get("tags") or "").lower()
@@ -327,16 +341,48 @@ def build_new_vs_returning(agg_cust):
         s[k]["count"] += 1; s[k]["net_sales"] += d["net_sales"]; s[k]["orders"] += d["orders"]
     return s
 
-def add_pareto_cols(rows, revenue_key="net_sales"):
-    total = sum(r[revenue_key] for r in rows)
-    cum = 0.0
+# ── PARETO COLUMNS — v1.1 ─────────────────────────────────────────
+def add_pareto_cols(rows, revenue_key="net_sales", gp_key="gross_profit"):
+    """
+    v1.1 CHANGES:
+    - pct_revenue y cum_pct siguen siendo sobre net_sales (para ranking)
+    - ADDED: pct_gs y cum_gs_pct sobre gross_sales
+    - ADDED: pct_gp y cum_gp_pct sobre gross_profit
+    - pareto_zone ahora se asigna por cum_gp_pct (Ceci quiere 80% GP):
+        Zone A: cum_gp_pct <= 80%
+        Zone B: cum_gp_pct <= 95%
+        Zone C: resto
+
+    Los productos se ordenan por net_sales (desc) antes de llamar esta función.
+    Así "ordenamos por Net Sales para llegar al 80% del Gross Profit."
+    """
+    total_rev = sum(r.get(revenue_key, 0) for r in rows) or 1
+    total_gs  = sum(r.get("gross_sales", 0) for r in rows) or 1
+    total_gp  = sum(r.get(gp_key, 0) for r in rows) or 1
+
+    cum_rev = 0.0
+    cum_gs  = 0.0
+    cum_gp  = 0.0
+
     for i, r in enumerate(rows):
-        cum += r[revenue_key]
+        cum_rev += r.get(revenue_key, 0)
+        cum_gs  += r.get("gross_sales", 0)
+        cum_gp  += r.get(gp_key, 0)
+
         r["rank"]        = i + 1
-        r["pct_revenue"] = round(r[revenue_key]/total*100,2) if total else 0
-        r["cum_pct"]     = round(cum/total*100,2) if total else 0
-        r["pareto_zone"] = "A" if r["cum_pct"]<=80 else ("B" if r["cum_pct"]<=95 else "C")
-    return rows, total
+        # net_sales %
+        r["pct_revenue"] = round(r.get(revenue_key, 0) / total_rev * 100, 2)
+        r["cum_pct"]     = round(cum_rev / total_rev * 100, 2)
+        # gross_sales % — ADDED
+        r["pct_gs"]      = round(r.get("gross_sales", 0) / total_gs * 100, 2)
+        r["cum_gs_pct"]  = round(cum_gs / total_gs * 100, 2)
+        # gross_profit % — ADDED
+        r["pct_gp"]      = round(r.get(gp_key, 0) / total_gp * 100, 2)
+        r["cum_gp_pct"]  = round(cum_gp / total_gp * 100, 2)
+        # CHANGED: zone based on GP cumulative, not revenue cumulative
+        r["pareto_zone"] = "A" if r["cum_gp_pct"] <= 80 else ("B" if r["cum_gp_pct"] <= 95 else "C")
+
+    return rows, total_rev
 
 # ── SHEETS ────────────────────────────────────────────────────────
 def get_gc():
@@ -344,10 +390,6 @@ def get_gc():
     return gspread.authorize(creds)
 
 def sheets_call(fn, *args, **kwargs):
-    """
-    Wrapper para cualquier llamada a gspread con retry automatico en 429/500.
-    Google Sheets API permite 60 write requests/minuto por usuario.
-    """
     for attempt in range(8):
         try:
             return fn(*args, **kwargs)
@@ -355,40 +397,27 @@ def sheets_call(fn, *args, **kwargs):
             status = e.response.status_code if hasattr(e, "response") else 0
             if status == 429 or status >= 500:
                 wait = min(15 * (attempt + 1), 90)
-                print(f"    Sheets API {status} — waiting {wait}s (attempt {attempt+1})...")
+                print(f"    Sheets API {status} — waiting {wait}s...")
                 time.sleep(wait)
                 continue
             raise
         except Exception as e:
             if attempt < 3:
-                print(f"    Sheets error, retrying in 10s: {e}")
+                print(f"    Sheets error, retrying: {e}")
                 time.sleep(10)
                 continue
             raise
-    raise RuntimeError(f"Sheets call failed after 8 attempts")
+    raise RuntimeError("Sheets call failed after 8 attempts")
 
 def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
-    """
-    Upsert seguro con:
-    - retry automatico en 429 de Sheets API
-    - batches de 500 filas (maximo eficiente)
-    - sleep entre batches para no superar 60 writes/min
-    - usa batch_update en lugar de clear+append para reducir # de requests
-    """
-    BATCH_SIZE   = 500   # max rows per append_rows call
-    SLEEP_BATCH  = 2.0   # seconds between batches (keeps under 60/min)
-    SLEEP_TAB    = 5.0   # seconds between tabs
+    BATCH_SIZE   = 500
+    SLEEP_BATCH  = 2.0
+    SLEEP_TAB    = 5.0
 
-    # Get or create worksheet
-    try:
-        ws = sh.worksheet(tab_name)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sheets_call(sh.add_worksheet, tab_name,
-                         rows=max(5000, len(new_rows) + 100),
-                         cols=len(headers) + 2)
-        time.sleep(2)
+    try:    ws = sh.worksheet(tab_name)
+    except: ws = sheets_call(sh.add_worksheet, tab_name, rows=max(5000, len(new_rows)+100), cols=len(headers)+2)
+    time.sleep(2)
 
-    # Read existing data for upsert merge
     existing = {}
     try:
         vals = sheets_call(ws.get_all_values)
@@ -396,73 +425,49 @@ def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
             ex_h = vals[0]
             for r in vals[1:]:
                 m = {ex_h[i]: (r[i] if i < len(r) else "") for i in range(len(ex_h))}
-                k = tuple(str(m.get(c, "")).strip() for c in key_cols)
-                if any(k):
-                    existing[k] = [m.get(h, "") for h in headers]
+                k = tuple(str(m.get(c,"")).strip() for c in key_cols)
+                if any(k): existing[k] = [m.get(h,"") for h in headers]
     except Exception as e:
-        print(f"    Warning: could not read existing data for {tab_name}: {e}")
+        print(f"    Warning reading {tab_name}: {e}")
 
-    # Merge: new rows overwrite existing rows with same key
     for row in new_rows:
         m = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        k = tuple(str(m.get(c, "")).strip() for c in key_cols)
+        k = tuple(str(m.get(c,"")).strip() for c in key_cols)
         existing[k] = row
 
-    # Sort merged data
     def sort_key(r):
         m = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
-        period_start = str(m.get("period_start", "") or "")
-        rank         = int(m.get("rank", 0) or 0)
-        period       = str(m.get("period", "") or "")
-        return (period_start, period, rank)
+        return (str(m.get("period_start","") or ""), str(m.get("period","") or ""), int(m.get("rank",0) or 0))
 
     merged = sorted(existing.values(), key=sort_key)
-
-    # Build full data matrix (headers + all rows), convert everything to str/num
     all_data = [headers]
     for r in merged:
         clean = []
         for v in r:
-            if v is None:
-                clean.append("")
-            elif isinstance(v, float) and (v != v):  # NaN check
-                clean.append("")
-            elif hasattr(v, 'strftime'):  # date/datetime object -> force string
-                clean.append(v.strftime("%Y-%m-%d"))
-            else:
-                clean.append(str(v) if not isinstance(v, (int, float, bool)) else v)
+            if v is None: clean.append("")
+            elif isinstance(v, float) and (v != v): clean.append("")
+            elif hasattr(v, 'strftime'): clean.append(v.strftime("%Y-%m-%d"))
+            else: clean.append(str(v) if not isinstance(v,(int,float,bool)) else v)
         all_data.append(clean)
 
     total_rows = len(all_data)
-    total_cols = len(headers)
-
-    # Resize worksheet if needed
-    if total_rows > ws.row_count or total_cols > ws.col_count:
-        sheets_call(ws.resize,
-                    rows=total_rows + 50,
-                    cols=total_cols + 2)
+    if total_rows > ws.row_count or len(headers) > ws.col_count:
+        sheets_call(ws.resize, rows=total_rows+50, cols=len(headers)+2)
         time.sleep(1)
 
-    # Clear and write in one batch_update call (counts as 1 write request)
     sheets_call(ws.clear)
     time.sleep(1)
 
-    # Write in batches of BATCH_SIZE rows
     written = 0
     for i in range(0, len(all_data), BATCH_SIZE):
-        batch = all_data[i:i + BATCH_SIZE]
-        sheets_call(
-            ws.append_rows, batch,
-            value_input_option="RAW",
-            insert_data_option="INSERT_ROWS",
-        )
+        batch = all_data[i:i+BATCH_SIZE]
+        sheets_call(ws.append_rows, batch, value_input_option="RAW", insert_data_option="INSERT_ROWS")
         written += len(batch)
         print(f"    {tab_name}: {written}/{total_rows} rows written...")
-        if i + BATCH_SIZE < len(all_data):
-            time.sleep(SLEEP_BATCH)
+        if i+BATCH_SIZE < len(all_data): time.sleep(SLEEP_BATCH)
 
-    time.sleep(SLEEP_TAB)  # pause between tabs
-    print(f"    ok {tab_name}: {len(new_rows)} new rows, {len(merged)} total stored")
+    time.sleep(SLEEP_TAB)
+    print(f"    ok {tab_name}: {len(new_rows)} new rows, {len(merged)} total")
 
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
@@ -475,9 +480,10 @@ def main():
     periods = [resolve_single(args.only, args.start, args.end)] if args.only else build_all_periods()
 
     print(f"\n{'='*60}")
-    print(f"  PARETO PIPELINE — Corro ({STORE_URL})")
+    print(f"  PARETO PIPELINE v1.1 — Corro ({STORE_URL})")
     print(f"  Mode  : {'single ('+args.only+')' if args.only else 'full backfill — '+str(len(periods))+' periods'}")
     print(f"  Sheet : {SHEET_ID}")
+    print(f"  Fix   : order deduplication + GP-based zones")
     print(f"{'='*60}\n")
 
     vmap         = fetch_products_map()
@@ -485,13 +491,19 @@ def main():
     prod_colls   = fetch_collections_map()
     sh           = get_gc().open_by_key(SHEET_ID)
 
+    # CHANGED: headers include cum_gs_pct and cum_gp_pct
     h_prod = ["updated_at","period","period_start","period_end","rank","pareto_zone",
               "product_title","product_type","vendor","sku_parent","product_id",
-              "gross_sales","discounts","net_sales","cogs","gross_profit",
-              "gp_pct","pct_revenue","cum_pct","units","orders","top_channel"]
+              "gross_sales","pct_gs","cum_gs_pct",
+              "net_sales","pct_revenue","cum_pct",
+              "cogs","gross_profit","gp_pct","pct_gp","cum_gp_pct",
+              "units","orders","top_channel"]
     h_cat  = ["updated_at","period","period_start","period_end","rank","pareto_zone",
-              "category","gross_sales","discounts","net_sales","cogs","gross_profit",
-              "gp_pct","pct_revenue","cum_pct","units","orders"]
+              "category",
+              "gross_sales","pct_gs","cum_gs_pct",
+              "net_sales","pct_revenue","cum_pct",
+              "cogs","gross_profit","gp_pct","pct_gp","cum_gp_pct",
+              "units","orders"]
     h_ch   = ["updated_at","period","period_start","period_end","rank","pareto_zone",
               "channel","gross_sales","discounts","net_sales","pct_revenue","cum_pct","units","orders"]
     h_cust = ["updated_at","period","period_start","period_end","rank","pareto_zone",
@@ -519,71 +531,97 @@ def main():
         au = build_pareto_customers(orders, start)
         nvr = build_new_vs_returning(au)
 
-        # Products
+        # Products — sorted by net_sales desc, zones by GP cumulative
         raws = []
         for pid, d in ap.items():
             gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
-            raws.append({"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],"discounts":d["discounts"],
+            raws.append({
+                "net_sales":d["net_sales"],"gross_sales":d["gross_sales"],"discounts":d["discounts"],
                 "units":d["units"],"orders":len(d["orders"]),"product_id":pid,
                 "product_title":d["product_title"],"product_type":d["product_type"],
                 "vendor":d["vendor"],"sku_parent":d["sku_parent"],
                 "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp,
-                "top_channel":max(d["channels"],key=d["channels"].get) if d["channels"] else ""})
-        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
-        all_prod += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
-            r["product_title"],r["product_type"],r["vendor"],r["sku_parent"],r["product_id"],
-            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
-            round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],
-            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"],r["top_channel"]] for r in rs]
+                "top_channel":max(d["channels"],key=d["channels"].get) if d["channels"] else ""
+            })
+        # CHANGED: sorted by net_sales, zones assigned by GP cumulative
+        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+        all_prod += [[
+            now_str, pk, str(start), str(end),
+            r["rank"], r["pareto_zone"],
+            r["product_title"], r["product_type"], r["vendor"], r["sku_parent"], r["product_id"],
+            round(r["gross_sales"],2), r["pct_gs"], r["cum_gs_pct"],
+            round(r["net_sales"],2),   r["pct_revenue"], r["cum_pct"],
+            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"], r["pct_gp"], r["cum_gp_pct"],
+            r["units"], r["orders"], r["top_channel"]
+        ] for r in rs]
 
         # Categories
         raws = []
         for cat, d in ac.items():
             gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
-            raws.append({"category":cat,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
+            raws.append({
+                "category":cat,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
                 "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"]),
-                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp})
-        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
-        all_cat += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["category"],
-            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
-            round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],
-            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
+                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp
+            })
+        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+        all_cat += [[
+            now_str, pk, str(start), str(end),
+            r["rank"], r["pareto_zone"], r["category"],
+            round(r["gross_sales"],2), r["pct_gs"], r["cum_gs_pct"],
+            round(r["net_sales"],2),   r["pct_revenue"], r["cum_pct"],
+            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"], r["pct_gp"], r["cum_gp_pct"],
+            r["units"], r["orders"]
+        ] for r in rs]
 
         # Channels
         raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
                  "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
-        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
-        all_ch += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["channel"],
-            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
-            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
+        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+        all_ch += [[
+            now_str, pk, str(start), str(end),
+            r["rank"], r["pareto_zone"], r["channel"],
+            round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
+            r["pct_revenue"], r["cum_pct"], r["units"], r["orders"]
+        ] for r in rs]
 
         # Customers
-        raws = [dict(d,segment="New" if d["is_new"] else "Returning") for d in au.values()]
-        rs,_ = add_pareto_cols(sorted(raws,key=lambda x:x["net_sales"],reverse=True))
-        all_cust += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
-            r["customer_id"],r["name"],r["email"],r["segment"],
-            round(r["net_sales"],2),r["pct_revenue"],r["cum_pct"],
-            r["orders"],r["units"],r["first_order"],r["last_order"]] for r in rs]
+        raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
+        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+        all_cust += [[
+            now_str, pk, str(start), str(end),
+            r["rank"], r["pareto_zone"],
+            r["customer_id"], r["name"], r["email"], r["segment"],
+            round(r["net_sales"],2), r["pct_revenue"], r["cum_pct"],
+            r["orders"], r["units"], r["first_order"], r["last_order"]
+        ] for r in rs]
 
         # New vs Returning
         tc = sum(v["count"] for v in nvr.values()) or 1
         tr = sum(v["net_sales"] for v in nvr.values()) or 1
         for seg, v in nvr.items():
-            all_nvr.append([now_str,pk,str(start),str(end),seg.capitalize(),
-                v["count"],round(v["net_sales"],2),v["orders"],
-                round(v["count"]/tc*100,1),round(v["net_sales"]/tr*100,1)])
+            all_nvr.append([
+                now_str, pk, str(start), str(end), seg.capitalize(),
+                v["count"], round(v["net_sales"],2), v["orders"],
+                round(v["count"]/tc*100,1), round(v["net_sales"]/tr*100,1)
+            ])
 
-        print(f"  → {len(orders)} orders | New: {nvr['new']['count']} (${nvr['new']['net_sales']:,.0f}) | Returning: {nvr['returning']['count']} (${nvr['returning']['net_sales']:,.0f})")
+        za_count = sum(1 for r in rs if r["pareto_zone"]=="A")
+        print(f"  → {len(orders)} orders | Zone A: {za_count} products (GP-based) | "
+              f"New: {nvr['new']['count']} (${nvr['new']['net_sales']:,.0f}) | "
+              f"Returning: {nvr['returning']['count']} (${nvr['returning']['net_sales']:,.0f})")
 
     print(f"\n  Writing to Google Sheets...")
-    upsert_tab(sh,"pareto_products",  h_prod,all_prod,["period","product_id"])
-    upsert_tab(sh,"pareto_categories",h_cat, all_cat, ["period","category"])
-    upsert_tab(sh,"pareto_channels",  h_ch,  all_ch,  ["period","channel"])
-    upsert_tab(sh,"pareto_customers", h_cust,all_cust,["period","customer_id"])
-    upsert_tab(sh,"pareto_new_vs_ret",h_nvr, all_nvr, ["period","segment"])
+    upsert_tab(sh, "pareto_products",   h_prod, all_prod, ["period","product_id"])
+    upsert_tab(sh, "pareto_categories", h_cat,  all_cat,  ["period","category"])
+    upsert_tab(sh, "pareto_channels",   h_ch,   all_ch,   ["period","channel"])
+    upsert_tab(sh, "pareto_customers",  h_cust, all_cust, ["period","customer_id"])
+    upsert_tab(sh, "pareto_new_vs_ret", h_nvr,  all_nvr,  ["period","segment"])
 
     print(f"\n{'='*60}")
-    print(f"  ✓ Done — {len(periods)} periods | Sheet: {SHEET_ID}")
+    print(f"  ✓ Done v1.1 — {len(periods)} periods | Sheet: {SHEET_ID}")
+    print(f"  Orders deduplication fix applied")
+    print(f"  Pareto zones based on Gross Profit cumulative")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
