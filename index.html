@@ -259,7 +259,6 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
   <!-- CHANNELS -->
   <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">Summary by Sales Channel</div></div>
   <div id="ch-summary"><div class="empty">Loading...</div></div>
-  <div class="ch-grid" style="margin-top:8px" id="ch-grid"></div>
 
   <!-- NEW VS RETURNING -->
   <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">New vs Returning customers — revenue summary</div></div>
@@ -631,25 +630,17 @@ function renderCategories(rawRows) {
 const CH_COLORS={"Wellington (POS)":"#D8B054","Concierge":"#A090FF","Online (Ecom)":"#72AEFF","Others":"#888"};
 function renderChannels(rows){
   const sumEl=$("ch-summary");
-  const el=$("ch-grid");el.innerHTML="";
-  if(!rows.length){sumEl.innerHTML="";el.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
+  if(!rows.length){sumEl.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
   const totalNS=rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
   sumEl.innerHTML=`<div class="sum-grid">${rows.map(r=>{
     const c=CH_COLORS[r.channel]||"#888";
     const pctNS=((parseFloat(r.net_sales||0)/totalNS)*100).toFixed(1);
     return `<div class="sum-card"><div class="sum-label" style="color:${c}">${r.channel}</div>
       <div class="sum-v" style="color:${c}">${fmt$(r.net_sales)}</div>
-      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(r.orders)} orders</div></div>`;
+      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(r.orders)} orders · ${fmtN(r.units)} units</div>
+      <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:9px;overflow:hidden"><div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${c}"></div></div>
+    </div>`;
   }).join("")}</div>`;
-  rows.forEach(r=>{
-    const c=CH_COLORS[r.channel]||"#888";
-    const d=document.createElement("div");d.className="chc";
-    d.innerHTML=`<div class="chc-name">${r.channel}</div>
-      <div class="chc-v" style="color:${c}">${fmt$(r.net_sales)}</div>
-      <div class="chc-sub">${fmtP(r.pct_revenue)} &nbsp;·&nbsp; ${fmtN(r.orders)} orders &nbsp;·&nbsp; ${fmtN(r.units)} units</div>
-      <div class="chc-bar"><div class="chc-barf" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${c}"></div></div>`;
-    el.appendChild(d);
-  });
 }
 
 // ── NEW VS RETURNING ──────────────────────────────────────────────
