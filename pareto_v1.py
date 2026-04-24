@@ -314,8 +314,32 @@ def fetch_shopifyql_sales(start, end):
     """
 
     def run_shopifyql(q):
-        """Run a ShopifyQL query, return (cols, rows, errors)."""
-        d = shopify_graphql(GQL, {"q": q})
+        """Run a ShopifyQL query, return (cols, rows, errors).
+        shopifyqlQuery requires API version 2025-01+ — use that version specifically.
+        """
+        # Override URL to use 2025-01 where shopifyqlQuery exists
+        url     = f"https://{STORE_URL}/admin/api/2026-01/graphql.json"
+        headers = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
+        for attempt in range(8):
+            try:
+                r = requests.post(url, headers=headers, json={"query": GQL, "variables": {"q": q}}, timeout=60)
+            except requests.exceptions.ConnectionError as e:
+                time.sleep(min(2**attempt, 60)); continue
+            if r.status_code == 429:
+                time.sleep(int(r.headers.get("Retry-After", 2**attempt))); continue
+            if r.status_code in (502, 503, 504):
+                time.sleep(min(2**attempt, 60)); continue
+            r.raise_for_status()
+            d = r.json()
+            throttled = any(
+                (e.get("extensions") or {}).get("code") == "THROTTLED"
+                for e in (d.get("errors") or [])
+            )
+            if throttled:
+                time.sleep(min(2**attempt, 60)); continue
+            break
+        else:
+            return [], [], [{"code": "FAILED", "message": "max retries"}]
         # Log full response for debugging — helps diagnose scope/auth issues
         raw_errors  = d.get("errors")  # top-level GraphQL errors (auth, scope)
         shopifyql_q = (d.get("data") or {}).get("shopifyqlQuery")
