@@ -308,7 +308,7 @@ def fetch_shopifyql_sales(start, end):
           columns { name dataType }
           rows
         }
-        parseErrors { code message range { start end } }
+        parseErrors
       }
     }
     """
@@ -349,12 +349,17 @@ def fetch_shopifyql_sales(start, end):
             print(f"  ✗ shopifyqlQuery is null — token missing read_reports scope")
             print(f"    Full response: {str(d)[:500]}")
             return [], [], [{"code": "NULL_RESPONSE", "message": "shopifyqlQuery returned null"}]
-        errs  = shopifyql_q.get("parseErrors") or []
+        # In API 2026-01 parseErrors is a String scalar, not an object list
+        raw_parse_errs = shopifyql_q.get("parseErrors")
+        if raw_parse_errs:
+            errs = [{"code": "PARSE_ERROR", "message": str(raw_parse_errs)}]
+        else:
+            errs = []
         table = shopifyql_q.get("tableData") or {}
         cols  = [c["name"] for c in (table.get("columns") or [])]
         rows  = table.get("rows") or []
         if errs:
-            print(f"  ⚠ parseErrors: {errs}")
+            print(f"  ⚠ parseErrors: {raw_parse_errs}")
         print(f"    → cols={cols}  rows={len(rows)}")
         return cols, rows, errs
 
