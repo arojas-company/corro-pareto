@@ -1,689 +1,809 @@
-"""
-PARETO PIPELINE v1.2 — Equestrian Labs / Corro
-===============================================
-Cambios v1.2 vs v1.1:
-- CHANGED: Products and categories now sorted by Gross Profit DESC (previously Net Sales).
-  Zone A still = 80% cumulative GP.
-- CHANGED: build_pareto_categories now uses product_type (mapped to 5 main categories)
-  instead of Shopify collections. Categories: Tack & Equipment, Rider Apparel & Accessories,
-  Horse Care, Dogs, Stable & Other, Uncategorized.
-- ADDED: map_product_type_to_category() helper with confirmed product_type keywords (April 2026).
-
-Cambios v1.1 vs v1.0:
-- FIXED: duplicación de órdenes. fetch_orders usaba financial_status como
-  lista separada por comas — Shopify REST no soporta eso directamente,
-  hacía múltiples requests y duplicaba. Ahora usa dos requests (paid/refunded)
-  y deduplica por order id. Esperado ~8,800 ordenes en 2025 (no 18.2K).
-- CHANGED: Pareto Zone A ahora se basa en Gross Profit (cum_gp_pct ≤ 80%)
-  en lugar de Net Sales. Así los 403 productos que producen el 80% del GP
-  se marcan como Zone A.
-- ADDED: columna cum_gp_pct (acumulado de Gross Profit %) en pareto_products
-  y pareto_categories.
-- ADDED: columna cum_gs_pct (acumulado de Gross Sales %) — el frontend
-  necesita ambos acumulados.
-- NOTE: los productos se siguen ORDENANDO por net_sales (descendente),
-  pero la zona se asigna por GP acumulado. Esto es lo que pidió Ceci:
-  "ordenarlo por Net Sales para llegar al 80% del Gross Profit."
-
-Run modes (sin cambios):
-  python pareto_v1.py                     # all periods 2024 → today
-  python pareto_v1.py --only q4_2025     # single quarter
-  python pareto_v1.py --only full_year_2025
-  python pareto_v1.py --only custom --start 2025-01-01 --end 2025-12-31
-
-GitHub Actions secrets required:
-  SHOPIFY_TOKEN_CORRO   GOOGLE_CREDENTIALS   SHEET_ID_CORRO
-"""
-
-import os, json, requests, gspread, argparse, calendar
-from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta, date
-from collections import defaultdict
-import pytz
-
-TIMEZONE    = pytz.timezone("America/Bogota")
-API_VERSION = "2024-10"
-STORE_URL   = os.environ.get("SHOPIFY_STORE", "equestrian-labs.myshopify.com")
-TOKEN       = os.environ.get("SHOPIFY_TOKEN_CORRO", "")
-SHEET_ID    = os.environ.get("SHEET_ID_CORRO",
-              "1NnH7Ln3HP9AuJ5ohxgvVk6A5BnG9_iz9WPC9SxaaidI")
-SCOPES      = ["https://www.googleapis.com/auth/spreadsheets",
-               "https://www.googleapis.com/auth/drive"]
-START_YEAR  = 2024
-
-# ── PERIODS ───────────────────────────────────────────────────────
-def last_day(y, m):
-    return date(y, m, calendar.monthrange(y, m)[1])
-
-def build_all_periods():
-    today = datetime.now(TIMEZONE).date()
-    periods = []
-    for y in range(START_YEAR, today.year + 1):
-        ys = date(y, 1, 1)
-        ye = date(y, 12, 31) if y < today.year else today
-        periods.append((ys, ye, f"full_year_{y}"))
-        max_q = 4 if y < today.year else ((today.month - 1) // 3 + 1)
-        for q in range(1, max_q + 1):
-            qs = date(y, (q - 1) * 3 + 1, 1)
-            qe = last_day(y, q * 3) if (y < today.year or q < max_q) else today
-            periods.append((qs, qe, f"q{q}_{y}"))
-    periods.sort(key=lambda x: x[0], reverse=True)
-    return periods
-
-def resolve_single(key, start_override=None, end_override=None):
-    today = datetime.now(TIMEZONE).date()
-    if key == "custom" and start_override and end_override:
-        return date.fromisoformat(start_override), date.fromisoformat(end_override), "custom"
-    if key.startswith("full_year_"):
-        y = int(key.split("_")[-1])
-        return date(y, 1, 1), (date(y, 12, 31) if y < today.year else today), key
-    if key == "full_year":
-        return date(today.year, 1, 1), today, f"full_year_{today.year}"
-    if key.startswith("q") and "_" in key:
-        parts = key[1:].split("_"); q, y = int(parts[0]), int(parts[1])
-        qs = date(y, (q - 1) * 3 + 1, 1)
-        cur_q = (today.month - 1) // 3 + 1
-        qe = last_day(y, q * 3) if (y < today.year or q < cur_q) else today
-        return qs, qe, key
-    raise ValueError(f"Unknown period: {key}. Use full_year_YYYY, qN_YYYY, or custom.")
-
-# ── SHOPIFY REST ──────────────────────────────────────────────────
-import time
-
-def shopify_get(endpoint, params):
-    url = f"https://{STORE_URL}/admin/api/{API_VERSION}/{endpoint}"
-    headers = {"X-Shopify-Access-Token": TOKEN}
-    results = []
-    while url:
-        for attempt in range(8):
-            try:
-                r = requests.get(url, headers=headers, params=params, timeout=60)
-            except requests.exceptions.ConnectionError as e:
-                wait = min(2 ** attempt, 60)
-                print(f"    connection error — retrying in {wait}s: {e}")
-                time.sleep(wait)
-                continue
-            if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 2 ** attempt))
-                print(f"    rate-limited — waiting {wait}s...")
-                time.sleep(wait)
-                continue
-            if r.status_code in (502, 503, 504):
-                wait = min(2 ** attempt, 60)
-                print(f"    {r.status_code} — retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            break
-        else:
-            r.raise_for_status()
-        data = r.json()
-        key = [k for k in data if k != "errors"][0]
-        results.extend(data[key])
-        link = r.headers.get("Link", ""); url = None; params = {}
-        if 'rel="next"' in link:
-            for part in link.split(","):
-                if 'rel="next"' in part:
-                    url = part.split(";")[0].strip().strip("<>")
-        time.sleep(0.3)
-    return results
-
-# ── FIX v1.1: fetch_orders sin duplicación ────────────────────────
-def fetch_orders(start, end):
-    """
-    FIXED v1.1: La versión anterior pasaba financial_status como lista
-    separada por comas en un solo parámetro. Shopify REST acepta eso en
-    algunos endpoints pero con paginación puede duplicar. Ahora hacemos
-    DOS requests separados (paid+partially_paid y partially_refunded+refunded)
-    y deduplicamos por order id.
-
-    Resultado esperado: ~8,800 órdenes en 2025 (la mitad de los 18.2K anteriores).
-    """
-    print(f"  Fetching orders {start} → {end} (deduplication fix v1.1)...")
-
-    seen_ids = set()
-    all_orders = []
-
-    # Batch 1: paid + partially_paid
-    for status in ["paid,partially_paid", "partially_refunded,refunded"]:
-        batch = shopify_get("orders.json", {
-            "status": "any",
-            "financial_status": status,
-            "created_at_min": f"{start}T00:00:00-05:00",
-            "created_at_max": f"{end}T23:59:59-05:00",
-            "limit": 250,
-            "fields": "id,name,created_at,subtotal_price,total_discounts,"
-                      "source_name,tags,line_items,customer",
-        })
-        for o in batch:
-            oid = o.get("id")
-            if oid and oid not in seen_ids:
-                seen_ids.add(oid)
-                all_orders.append(o)
-
-    print(f"  → {len(all_orders)} unique orders (after dedup)")
-    return all_orders
-
-def fetch_products_map():
-    print("  Fetching product catalogue...")
-    products = shopify_get("products.json", {"limit": 250, "fields": "id,title,vendor,product_type,variants"})
-    vmap = {}
-    for p in products:
-        for v in p.get("variants", []):
-            vmap[str(v["id"])] = {
-                "product_id":        str(p["id"]),
-                "product_title":     p.get("title", ""),
-                "sku_parent":        v.get("sku", "").split("-")[0] if v.get("sku") else "",
-                "vendor":            p.get("vendor", ""),
-                "product_type":      p.get("product_type", "Uncategorized"),
-                "inventory_item_id": str(v.get("inventory_item_id", "")),
-            }
-    print(f"  → {len(products)} products / {len(vmap)} variants")
-    return vmap
-
-def fetch_cogs_map():
-    print("  Fetching COGS from inventory items...")
-    all_variants = shopify_get("variants.json", {"limit": 250, "fields": "id,inventory_item_id"})
-    iids = [str(v["inventory_item_id"]) for v in all_variants if v.get("inventory_item_id")]
-    cost_map = {}
-    for i in range(0, len(iids), 100):
-        items = shopify_get("inventory_items.json", {
-            "ids": ",".join(iids[i:i+100]), "limit": 100, "fields": "id,cost"
-        })
-        for item in items:
-            cost_map[str(item["id"])] = float(item.get("cost") or 0)
-    variant_cost = {}
-    for v in all_variants:
-        variant_cost[str(v["id"])] = cost_map.get(str(v.get("inventory_item_id", "")), 0.0)
-    filled = sum(1 for c in variant_cost.values() if c > 0)
-    print(f"  → {len(variant_cost)} variants, {filled} with COGS > 0")
-    return variant_cost
-
-def fetch_collections_map():
-    print("  Fetching collections (titles)...")
-    colls = {}
-    for c in shopify_get("custom_collections.json", {"limit": 250, "fields": "id,title"}):
-        colls[str(c["id"])] = c["title"]
-    for c in shopify_get("smart_collections.json", {"limit": 250, "fields": "id,title"}):
-        colls[str(c["id"])] = c["title"]
-    print(f"  → {len(colls)} collection titles loaded")
-    print("  Fetching all collects...")
-    prod_colls = defaultdict(list)
-    all_collects = shopify_get("collects.json", {"limit": 250, "fields": "collection_id,product_id"})
-    for co in all_collects:
-        cid = str(co.get("collection_id", ""))
-        pid = str(co.get("product_id", ""))
-        title = colls.get(cid)
-        if title and pid and title not in prod_colls[pid]:
-            prod_colls[pid].append(title)
-    print(f"  → {len(prod_colls)} products mapped to collections")
-    return prod_colls
-
-# ── CHANNEL DETECTION ─────────────────────────────────────────────
-def detect_channel(order):
-    src  = (order.get("source_name") or "").lower().strip()
-    tags = (order.get("tags") or "").lower()
-    if "concierge" in tags or "concierge" in src:
-        return "Concierge"
-    if src == "pos" or "wellington" in tags:
-        return "Wellington (POS)"
-    return "Online (Ecom)"
-
-def audit_concierge_tags(orders, sample=30):
-    tag_counts = defaultdict(int)
-    concierge_count = 0
-    for o in orders:
-        tags = (o.get("tags") or "").strip()
-        src  = (o.get("source_name") or "").strip()
-        key  = f"source={src!r:20} | tags={tags[:80]!r}" if (tags or src) else "(no tags)"
-        tag_counts[key] += 1
-        if "concierge" in tags.lower() or "concierge" in src.lower():
-            concierge_count += 1
-    print("\n  ── CONCIERGE TAG AUDIT ──────────────────────────────")
-    print(f"  Orders matching 'concierge': {concierge_count} / {len(orders)}")
-    for k, cnt in sorted(tag_counts.items(), key=lambda x: -x[1])[:sample]:
-        print(f"    {cnt:>5}x  {k}")
-    print("  ────────────────────────────────────────────────────\n")
-
-# ── AGGREGATION ───────────────────────────────────────────────────
-def build_pareto_products(orders, vmap, variant_cost):
-    agg = defaultdict(lambda: {
-        "product_id":"","product_title":"","product_type":"","vendor":"","sku_parent":"",
-        "gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,
-        "units":0,"orders":set(),"channels":defaultdict(float),
-    })
-    for order in orders:
-        disc_total  = float(order.get("total_discounts",0) or 0)
-        li_count    = len(order.get("line_items",[])) or 1
-        disc_per_li = disc_total / li_count
-        for li in order.get("line_items",[]):
-            vid   = str(li.get("variant_id") or "")
-            info  = vmap.get(vid,{"product_id":str(li.get("product_id","")),"product_title":li.get("title","Unknown"),"product_type":"Uncategorized","vendor":"","sku_parent":""})
-            pid   = info["product_id"]
-            qty   = int(li.get("quantity",0) or 0)
-            price = float(li.get("price",0) or 0) * qty
-            net   = max(price - disc_per_li, 0)
-            cost  = variant_cost.get(vid, 0.0) * qty
-            row   = agg[pid]
-            row["product_id"]    = pid
-            row["product_title"] = info["product_title"]
-            row["product_type"]  = info["product_type"]
-            row["vendor"]        = info["vendor"]
-            row["sku_parent"]    = info["sku_parent"]
-            row["gross_sales"]  += price
-            row["discounts"]    += disc_per_li
-            row["net_sales"]    += net
-            row["cogs"]         += cost
-            row["gross_profit"] += max(net - cost, 0)
-            row["units"]        += qty
-            row["orders"].add(order["id"])
-            row["channels"][detect_channel(order)] += net
-    return agg
-
-def map_product_type_to_category(raw_type):
-    """
-    v1.2: Maps Shopify product_type values to the 5 main categories
-    confirmed by Ceci / Shopify AI (April 2026).
-    English labels kept intentionally — dashboard is in English.
-    """
-    if not raw_type:
-        return "Uncategorized"
-    t = raw_type.strip().lower()
-
-    # ── Equipo & Tack ──────────────────────────────────────────────
-    tack_kw = [
-        "bridle", "rein", "bridle accessories",
-        "saddle pad", "all purpose", "hunter/jumper", "dressage saddle",
-        "half pad", "stirrup", "dressage bridle",
-        "belt",
-    ]
-    if any(k in t for k in tack_kw):
-        return "Tack & Equipment"
-
-    # ── Rider Apparel & Accessories ───────────────────────────────
-    rider_kw = [
-        "apparel", "breeches", "accessories", "hat", "shirt",
-        "schooling", "leather handbag", "handbag",
-    ]
-    if any(k in t for k in rider_kw):
-        return "Rider Apparel & Accessories"
-
-    # ── Horse Care ────────────────────────────────────────────────
-    care_kw = [
-        "detangler", "body brace", "hoof care", "poultice",
-        "liniment", "relief spray", "shampoo", "fungal", "skin & hair",
-        "supplement", "personal care",
-    ]
-    if any(k in t for k in care_kw):
-        return "Horse Care"
-
-    # ── Dogs ──────────────────────────────────────────────────────
-    if t.startswith("dog"):
-        return "Dogs"
-
-    # ── Stable & Other ────────────────────────────────────────────
-    stable_kw = [
-        "stall mat", "stall & trailer", "trailer cleaning",
-        "cavali club", "spring 2024", "special edition",
-        "_elite_gift", "elite_gift",
-    ]
-    if any(k in t for k in stable_kw):
-        return "Stable & Other"
-
-    return "Uncategorized"
-
-
-def build_pareto_categories(orders, vmap, prod_colls, variant_cost):
-    # v1.2: uses product_type (mapped to 5 main categories) instead of collections
-    agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,"units":0,"orders":set()})
-    for order in orders:
-        disc_total  = float(order.get("total_discounts",0) or 0)
-        li_count    = len(order.get("line_items",[])) or 1
-        disc_per_li = disc_total / li_count
-        for li in order.get("line_items",[]):
-            vid   = str(li.get("variant_id") or "")
-            info  = vmap.get(vid,{"product_id":"","product_type":"Uncategorized"})
-            pid   = info["product_id"]
-            cat   = map_product_type_to_category(info.get("product_type",""))
-            qty   = int(li.get("quantity",0) or 0)
-            price = float(li.get("price",0) or 0) * qty
-            net   = max(price - disc_per_li, 0)
-            cost  = variant_cost.get(vid, 0.0) * qty
-            agg[cat]["gross_sales"]  += price
-            agg[cat]["discounts"]    += disc_per_li
-            agg[cat]["net_sales"]    += net
-            agg[cat]["cogs"]         += cost
-            agg[cat]["gross_profit"] += max(net - cost, 0)
-            agg[cat]["units"]        += qty
-            agg[cat]["orders"].add(order["id"])
-    return agg
-
-def build_pareto_channels(orders):
-    agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"units":0,"orders":set()})
-    for order in orders:
-        ch   = detect_channel(order)
-        disc = float(order.get("total_discounts",0) or 0)
-        sub  = float(order.get("subtotal_price",0) or 0)
-        units = sum(int(li.get("quantity",0) or 0) for li in order.get("line_items",[]))
-        agg[ch]["gross_sales"] += sub + disc
-        agg[ch]["discounts"]   += disc
-        agg[ch]["net_sales"]   += sub
-        agg[ch]["units"]       += units
-        agg[ch]["orders"].add(order["id"])
-    return agg
-
-def build_pareto_customers(orders, period_start):
-    agg = defaultdict(lambda: {"customer_id":"","name":"","email":"","gross_sales":0.0,"net_sales":0.0,"orders":0,"units":0,"first_order":"9999-99-99","last_order":"0000-00-00","is_new":True})
-    for order in orders:
-        c    = order.get("customer") or {}
-        cid  = str(c.get("id", f"guest_{order['id']}"))
-        sub  = float(order.get("subtotal_price",0) or 0)
-        disc = float(order.get("total_discounts",0) or 0)
-        units = sum(int(li.get("quantity",0) or 0) for li in order.get("line_items",[]))
-        d    = order.get("created_at","")[:10]
-        is_new = (c.get("created_at") or d)[:10] >= str(period_start)
-        row  = agg[cid]
-        row["customer_id"]  = cid
-        row["name"]         = f"{c.get('first_name','')} {c.get('last_name','')}".strip() or "Guest"
-        row["email"]        = c.get("email","")
-        row["gross_sales"] += sub + disc
-        row["net_sales"]   += sub
-        row["orders"]      += 1
-        row["units"]       += units
-        row["is_new"]       = is_new
-        if d < row["first_order"]: row["first_order"] = d
-        if d > row["last_order"]:  row["last_order"]  = d
-    return agg
-
-def build_new_vs_returning(agg_cust):
-    s = {"new":{"count":0,"net_sales":0.0,"orders":0},"returning":{"count":0,"net_sales":0.0,"orders":0}}
-    for d in agg_cust.values():
-        k = "new" if d["is_new"] else "returning"
-        s[k]["count"] += 1; s[k]["net_sales"] += d["net_sales"]; s[k]["orders"] += d["orders"]
-    return s
-
-# ── PARETO COLUMNS — v1.1 ─────────────────────────────────────────
-def add_pareto_cols(rows, revenue_key="net_sales", gp_key="gross_profit"):
-    """
-    v1.1 CHANGES:
-    - pct_revenue y cum_pct siguen siendo sobre net_sales (para ranking)
-    - ADDED: pct_gs y cum_gs_pct sobre gross_sales
-    - ADDED: pct_gp y cum_gp_pct sobre gross_profit
-    - pareto_zone ahora se asigna por cum_gp_pct (Ceci quiere 80% GP):
-        Zone A: cum_gp_pct <= 80%
-        Zone B: cum_gp_pct <= 95%
-        Zone C: resto
-
-    Los productos se ordenan por net_sales (desc) antes de llamar esta función.
-    Así "ordenamos por Net Sales para llegar al 80% del Gross Profit."
-    """
-    total_rev = sum(r.get(revenue_key, 0) for r in rows) or 1
-    total_gs  = sum(r.get("gross_sales", 0) for r in rows) or 1
-    total_gp  = sum(r.get(gp_key, 0) for r in rows) or 1
-
-    cum_rev = 0.0
-    cum_gs  = 0.0
-    cum_gp  = 0.0
-
-    for i, r in enumerate(rows):
-        cum_rev += r.get(revenue_key, 0)
-        cum_gs  += r.get("gross_sales", 0)
-        cum_gp  += r.get(gp_key, 0)
-
-        r["rank"]        = i + 1
-        # net_sales %
-        r["pct_revenue"] = round(r.get(revenue_key, 0) / total_rev * 100, 2)
-        r["cum_pct"]     = round(cum_rev / total_rev * 100, 2)
-        # gross_sales % — ADDED
-        r["pct_gs"]      = round(r.get("gross_sales", 0) / total_gs * 100, 2)
-        r["cum_gs_pct"]  = round(cum_gs / total_gs * 100, 2)
-        # gross_profit % — ADDED
-        r["pct_gp"]      = round(r.get(gp_key, 0) / total_gp * 100, 2)
-        r["cum_gp_pct"]  = round(cum_gp / total_gp * 100, 2)
-        # CHANGED: zone based on GP cumulative, not revenue cumulative
-        r["pareto_zone"] = "A" if r["cum_gp_pct"] <= 80 else ("B" if r["cum_gp_pct"] <= 95 else "C")
-
-    return rows, total_rev
-
-# ── SHEETS ────────────────────────────────────────────────────────
-def get_gc():
-    creds = Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
-    return gspread.authorize(creds)
-
-def sheets_call(fn, *args, **kwargs):
-    for attempt in range(8):
-        try:
-            return fn(*args, **kwargs)
-        except gspread.exceptions.APIError as e:
-            status = e.response.status_code if hasattr(e, "response") else 0
-            if status == 429 or status >= 500:
-                wait = min(15 * (attempt + 1), 90)
-                print(f"    Sheets API {status} — waiting {wait}s...")
-                time.sleep(wait)
-                continue
-            raise
-        except Exception as e:
-            if attempt < 3:
-                print(f"    Sheets error, retrying: {e}")
-                time.sleep(10)
-                continue
-            raise
-    raise RuntimeError("Sheets call failed after 8 attempts")
-
-def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
-    BATCH_SIZE   = 500
-    SLEEP_BATCH  = 2.0
-    SLEEP_TAB    = 5.0
-
-    try:    ws = sh.worksheet(tab_name)
-    except: ws = sheets_call(sh.add_worksheet, tab_name, rows=max(5000, len(new_rows)+100), cols=len(headers)+2)
-    time.sleep(2)
-
-    existing = {}
-    try:
-        vals = sheets_call(ws.get_all_values)
-        if len(vals) >= 2:
-            ex_h = vals[0]
-            for r in vals[1:]:
-                m = {ex_h[i]: (r[i] if i < len(r) else "") for i in range(len(ex_h))}
-                k = tuple(str(m.get(c,"")).strip() for c in key_cols)
-                if any(k): existing[k] = [m.get(h,"") for h in headers]
-    except Exception as e:
-        print(f"    Warning reading {tab_name}: {e}")
-
-    for row in new_rows:
-        m = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        k = tuple(str(m.get(c,"")).strip() for c in key_cols)
-        existing[k] = row
-
-    def sort_key(r):
-        m = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
-        return (str(m.get("period_start","") or ""), str(m.get("period","") or ""), int(m.get("rank",0) or 0))
-
-    merged = sorted(existing.values(), key=sort_key)
-    all_data = [headers]
-    for r in merged:
-        clean = []
-        for v in r:
-            if v is None: clean.append("")
-            elif isinstance(v, float) and (v != v): clean.append("")
-            elif hasattr(v, 'strftime'): clean.append(v.strftime("%Y-%m-%d"))
-            else: clean.append(str(v) if not isinstance(v,(int,float,bool)) else v)
-        all_data.append(clean)
-
-    total_rows = len(all_data)
-    if total_rows > ws.row_count or len(headers) > ws.col_count:
-        sheets_call(ws.resize, rows=total_rows+50, cols=len(headers)+2)
-        time.sleep(1)
-
-    sheets_call(ws.clear)
-    time.sleep(1)
-
-    written = 0
-    for i in range(0, len(all_data), BATCH_SIZE):
-        batch = all_data[i:i+BATCH_SIZE]
-        sheets_call(ws.append_rows, batch, value_input_option="RAW", insert_data_option="INSERT_ROWS")
-        written += len(batch)
-        print(f"    {tab_name}: {written}/{total_rows} rows written...")
-        if i+BATCH_SIZE < len(all_data): time.sleep(SLEEP_BATCH)
-
-    time.sleep(SLEEP_TAB)
-    print(f"    ok {tab_name}: {len(new_rows)} new rows, {len(merged)} total")
-
-# ── MAIN ──────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--only", default=None)
-    parser.add_argument("--start"); parser.add_argument("--end")
-    args = parser.parse_args()
-
-    now_str = datetime.now(TIMEZONE).strftime("%Y-%m-%d %H:%M")
-    periods = [resolve_single(args.only, args.start, args.end)] if args.only else build_all_periods()
-
-    print(f"\n{'='*60}")
-    print(f"  PARETO PIPELINE v1.1 — Corro ({STORE_URL})")
-    print(f"  Mode  : {'single ('+args.only+')' if args.only else 'full backfill — '+str(len(periods))+' periods'}")
-    print(f"  Sheet : {SHEET_ID}")
-    print(f"  Fix   : order deduplication + GP-based zones")
-    print(f"{'='*60}\n")
-
-    vmap         = fetch_products_map()
-    variant_cost = fetch_cogs_map()
-    prod_colls   = fetch_collections_map()
-    sh           = get_gc().open_by_key(SHEET_ID)
-
-    # CHANGED: headers include cum_gs_pct and cum_gp_pct
-    h_prod = ["updated_at","period","period_start","period_end","rank","pareto_zone",
-              "product_title","product_type","vendor","sku_parent","product_id",
-              "gross_sales","pct_gs","cum_gs_pct",
-              "net_sales","pct_revenue","cum_pct",
-              "cogs","gross_profit","gp_pct","pct_gp","cum_gp_pct",
-              "units","orders","top_channel"]
-    h_cat  = ["updated_at","period","period_start","period_end","rank","pareto_zone",
-              "category",
-              "gross_sales","pct_gs","cum_gs_pct",
-              "net_sales","pct_revenue","cum_pct",
-              "cogs","gross_profit","gp_pct","pct_gp","cum_gp_pct",
-              "units","orders"]
-    h_ch   = ["updated_at","period","period_start","period_end","rank","pareto_zone",
-              "channel","gross_sales","discounts","net_sales","pct_revenue","cum_pct","units","orders"]
-    h_cust = ["updated_at","period","period_start","period_end","rank","pareto_zone",
-              "customer_id","name","email","segment","net_sales","pct_revenue","cum_pct",
-              "orders","units","first_order","last_order"]
-    h_nvr  = ["updated_at","period","period_start","period_end",
-              "segment","customers","net_sales","orders","pct_customers","pct_revenue"]
-
-    all_prod, all_cat, all_ch, all_cust, all_nvr = [], [], [], [], []
-    first_run = True
-
-    for idx, (start, end, pk) in enumerate(periods):
-        print(f"\n[{idx+1}/{len(periods)}] {pk}  ({start} → {end})")
-        orders = fetch_orders(start, end)
-        if not orders:
-            print("  ⚠ No orders — skipping"); continue
-
-        if first_run:
-            audit_concierge_tags(orders)
-            first_run = False
-
-        ap = build_pareto_products(orders, vmap, variant_cost)
-        ac = build_pareto_categories(orders, vmap, prod_colls, variant_cost)
-        ah = build_pareto_channels(orders)
-        au = build_pareto_customers(orders, start)
-        nvr = build_new_vs_returning(au)
-
-        # Products — sorted by net_sales desc, zones by GP cumulative
-        raws = []
-        for pid, d in ap.items():
-            gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
-            raws.append({
-                "net_sales":d["net_sales"],"gross_sales":d["gross_sales"],"discounts":d["discounts"],
-                "units":d["units"],"orders":len(d["orders"]),"product_id":pid,
-                "product_title":d["product_title"],"product_type":d["product_type"],
-                "vendor":d["vendor"],"sku_parent":d["sku_parent"],
-                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp,
-                "top_channel":max(d["channels"],key=d["channels"].get) if d["channels"] else ""
-            })
-        # v1.2 CHANGED: sorted by gross_profit desc (Ceci request), zones assigned by GP cumulative
-        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
-        all_prod += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"],
-            r["product_title"], r["product_type"], r["vendor"], r["sku_parent"], r["product_id"],
-            round(r["gross_sales"],2), r["pct_gs"], r["cum_gs_pct"],
-            round(r["net_sales"],2),   r["pct_revenue"], r["cum_pct"],
-            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"], r["pct_gp"], r["cum_gp_pct"],
-            r["units"], r["orders"], r["top_channel"]
-        ] for r in rs]
-
-        # Categories
-        raws = []
-        for cat, d in ac.items():
-            gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
-            raws.append({
-                "category":cat,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
-                "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"]),
-                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp
-            })
-        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))  # v1.2: sort by GP
-        all_cat += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["category"],
-            round(r["gross_sales"],2), r["pct_gs"], r["cum_gs_pct"],
-            round(r["net_sales"],2),   r["pct_revenue"], r["cum_pct"],
-            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"], r["pct_gp"], r["cum_gp_pct"],
-            r["units"], r["orders"]
-        ] for r in rs]
-
-        # Channels
-        raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
-                 "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
-        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-        all_ch += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["channel"],
-            round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
-            r["pct_revenue"], r["cum_pct"], r["units"], r["orders"]
-        ] for r in rs]
-
-        # Customers
-        raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
-        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-        all_cust += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"],
-            r["customer_id"], r["name"], r["email"], r["segment"],
-            round(r["net_sales"],2), r["pct_revenue"], r["cum_pct"],
-            r["orders"], r["units"], r["first_order"], r["last_order"]
-        ] for r in rs]
-
-        # New vs Returning
-        tc = sum(v["count"] for v in nvr.values()) or 1
-        tr = sum(v["net_sales"] for v in nvr.values()) or 1
-        for seg, v in nvr.items():
-            all_nvr.append([
-                now_str, pk, str(start), str(end), seg.capitalize(),
-                v["count"], round(v["net_sales"],2), v["orders"],
-                round(v["count"]/tc*100,1), round(v["net_sales"]/tr*100,1)
-            ])
-
-        za_count = sum(1 for r in rs if r["pareto_zone"]=="A")
-        print(f"  → {len(orders)} orders | Zone A: {za_count} products (GP-based) | "
-              f"New: {nvr['new']['count']} (${nvr['new']['net_sales']:,.0f}) | "
-              f"Returning: {nvr['returning']['count']} (${nvr['returning']['net_sales']:,.0f})")
-
-    print(f"\n  Writing to Google Sheets...")
-    upsert_tab(sh, "pareto_products",   h_prod, all_prod, ["period","product_id"])
-    upsert_tab(sh, "pareto_categories", h_cat,  all_cat,  ["period","category"])
-    upsert_tab(sh, "pareto_channels",   h_ch,   all_ch,   ["period","channel"])
-    upsert_tab(sh, "pareto_customers",  h_cust, all_cust, ["period","customer_id"])
-    upsert_tab(sh, "pareto_new_vs_ret", h_nvr,  all_nvr,  ["period","segment"])
-
-    print(f"\n{'='*60}")
-    print(f"  ✓ Done v1.1 — {len(periods)} periods | Sheet: {SHEET_ID}")
-    print(f"  Orders deduplication fix applied")
-    print(f"  Pareto zones based on Gross Profit cumulative")
-    print(f"{'='*60}\n")
-
-if __name__ == "__main__":
-    main()
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Pareto Sales Analysis — Equestrian Labs</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@500;600;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+[data-theme="light"]{
+  --bg:#F0EEE9;--sf:#FFFFFF;--sf2:#F5F3EF;--sf3:#EAE8E3;
+  --bd:#DEDAD3;--bd2:#C5C1B8;--tx:#0F0E0C;--tx2:#58564F;--tx3:#8E8C85;
+  --A:#0C7050;--A-bg:#D2F0E4;--A-bd:rgba(12,112,80,.18);
+  --B:#7D5E0E;--B-bg:#FEF3D2;--B-bd:rgba(125,94,14,.18);
+  --C:#8E3828;--C-bg:#FAE2DC;--C-bd:rgba(142,56,40,.18);
+  --bar-a:#0C7050;--bar-b:#D8B054;--bar-c:#D85A30;
+  --acc-gs:#1450A8;--acc-gp:#0C7050;
+}
+[data-theme="dark"]{
+  --bg:#0A0A09;--sf:#141412;--sf2:#1C1C1A;--sf3:#242422;
+  --bd:#2A2A28;--bd2:#3C3C3A;--tx:#F0EFE8;--tx2:#C0BEB7;--tx3:#72706A;
+  --A:#2EE896;--A-bg:#0A3020;--A-bd:rgba(46,232,150,.2);
+  --B:#D8B054;--B-bg:#2A2008;--B-bd:rgba(216,176,84,.2);
+  --C:#F06868;--C-bg:#300808;--C-bd:rgba(240,104,104,.2);
+  --bar-a:#2EE896;--bar-b:#D8B054;--bar-c:#F06868;
+  --acc-gs:#72AEFF;--acc-gp:#2EE896;
+}
+html,body{min-height:100%;font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--tx);font-size:14px}
+.wrap{max-width:1280px;margin:0 auto;padding:24px 20px 60px}
+.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+.brand-row{display:flex;align-items:flex-start;gap:8px}
+.brand-dot{width:8px;height:8px;border-radius:50%;background:var(--A);margin-top:3px;flex-shrink:0}
+.brand-name{font-family:'Syne',sans-serif;font-size:14px;font-weight:700;letter-spacing:-.02em}
+.brand-sub{font-size:10px;color:var(--tx3);margin-top:1px}
+h1{font-family:'Syne',sans-serif;font-size:24px;font-weight:800;letter-spacing:-.04em;line-height:1.1;margin-top:10px}
+h1 span{color:var(--A)}
+.period-info{font-size:11px;color:var(--tx3);margin-top:5px}
+.controls{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+.sel-group{display:flex;flex-direction:column;gap:3px}
+.sel-label{font-size:9px;font-weight:600;color:var(--tx3);text-transform:uppercase;letter-spacing:.08em}
+select.psel{font-family:'DM Sans',sans-serif;font-size:12px;font-weight:500;
+  color:#F0EFE8 !important;background:#1C1C1A !important;
+  border:1px solid var(--bd2);border-radius:6px;
+  padding:5px 26px 5px 10px;cursor:pointer;outline:none;appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23aaa' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 8px center;
+  min-width:120px;transition:border-color .12s}
+select.psel:focus{border-color:var(--A)}
+select.psel option{background:#1C1C1A;color:#F0EFE8}
+[data-theme="light"] select.psel{color:#0F0E0C !important;background:#F5F3EF !important}
+[data-theme="light"] select.psel option{background:#F5F3EF;color:#0F0E0C}
+.divider-v{width:1px;height:32px;background:var(--bd2)}
+.rfbtn{display:flex;align-items:center;gap:4px;padding:5px 12px;border-radius:6px;
+  border:1px solid var(--bd2);background:var(--sf2);color:var(--tx2);cursor:pointer;
+  font-size:11px;font-weight:500;font-family:'DM Sans',sans-serif;transition:all .12s}
+.rfbtn:hover{border-color:var(--A);color:var(--A)}
+.tbtn{width:28px;height:28px;border-radius:50%;border:1px solid var(--bd2);background:var(--sf2);
+  color:var(--tx2);cursor:pointer;font-size:13px;display:flex;align-items:center;justify-content:center}
+.sec{display:flex;align-items:center;gap:8px;margin:26px 0 11px}
+.sn{font-size:9px;font-weight:700;color:var(--tx3);letter-spacing:.12em;text-transform:uppercase;font-family:'Syne',sans-serif;white-space:nowrap}
+.sl{flex:1;height:1px;background:var(--bd)}
+.st{font-size:9px;font-weight:600;color:var(--tx3);letter-spacing:.1em;text-transform:uppercase;white-space:nowrap}
+
+/* METRIC DEFINITION BOX */
+.metric-def{background:var(--sf);border:1px solid var(--bd);border-radius:8px;padding:11px 16px;margin-bottom:16px;font-size:11px;color:var(--tx3);line-height:1.8}
+.metric-def strong{color:var(--tx2)}
+.metric-def .formula{font-family:'DM Mono',monospace;font-size:10px;color:var(--A);background:var(--A-bg);padding:2px 7px;border-radius:4px;display:inline-block;margin-top:4px}
+
+/* KPI CARDS */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:20px}
+.card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
+.card-l{font-size:10px;color:var(--tx3);font-weight:600;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
+.card-v{font-family:'Syne',sans-serif;font-size:22px;font-weight:700;letter-spacing:-.03em;line-height:1}
+.card-s{font-size:10px;color:var(--tx3);margin-top:4px}
+
+/* PARETO BAR */
+.cum-row{display:flex;height:26px;border-radius:7px;overflow:hidden;margin-bottom:9px;border:1px solid var(--bd)}
+.cum-seg{display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;
+  color:rgba(255,255,255,.9);transition:width .5s;cursor:default;overflow:hidden;white-space:nowrap}
+.legend{display:flex;gap:14px;flex-wrap:wrap}
+.leg-item{display:flex;align-items:center;gap:4px;font-size:10px;color:var(--tx3)}
+.leg-dot{width:8px;height:8px;border-radius:2px}
+.insight{background:var(--A-bg);border:1px solid var(--A-bd);border-radius:8px;
+  padding:13px 16px;margin:14px 0 0;font-size:12px;color:var(--tx2);line-height:1.75}
+.insight strong{color:var(--A)}
+
+/* TABLES */
+.tbl-wrap{background:var(--sf);border:1px solid var(--bd);border-radius:10px;overflow:hidden}
+.tbl-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--bd)}
+.tbl-title{font-size:12px;font-weight:600;color:var(--tx2)}
+.tbl-note{font-size:10px;color:var(--tx3)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{padding:7px 10px;text-align:left;font-size:9px;font-weight:700;color:var(--tx3);
+  letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--bd);background:var(--sf2);white-space:nowrap}
+thead th.r{text-align:right}
+thead th.gs-col{border-left:2px solid var(--acc-gs);color:var(--acc-gs)}
+thead th.gp-col{border-left:2px solid var(--acc-gp);color:var(--acc-gp)}
+tbody tr{border-bottom:1px solid var(--bd);transition:background .1s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:var(--sf2)}
+td{padding:7px 10px;color:var(--tx2);vertical-align:middle}
+td.r{text-align:right;font-family:'DM Mono',monospace;font-size:11px;color:var(--tx)}
+td.name{color:var(--tx);font-weight:500;max-width:200px}
+td.name small{display:block;font-size:10px;color:var(--tx3);font-weight:400;margin-top:1px}
+td.gs-sep{border-left:2px solid rgba(114,174,255,.2)}
+td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
+.zone{display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;
+  border-radius:5px;font-size:10px;font-weight:700;font-family:'Syne',sans-serif;flex-shrink:0}
+.zA{background:var(--A-bg);color:var(--A);border:1px solid var(--A-bd)}
+.zB{background:var(--B-bg);color:var(--B);border:1px solid var(--B-bd)}
+.zC{background:var(--C-bg);color:var(--C);border:1px solid var(--C-bd)}
+.bar-wrap{display:flex;align-items:center;gap:5px;min-width:80px}
+.bar-bg{flex:1;height:4px;background:var(--sf3);border-radius:2px;overflow:hidden}
+.bar-fill{height:100%;border-radius:2px;transition:width .4s}
+.bar-pct{font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3);min-width:34px;text-align:right}
+.cum-badge{display:inline-flex;align-items:center;gap:3px;font-family:'DM Mono',monospace;font-size:10px;padding:1px 6px;border-radius:3px;font-weight:500}
+.cum-gs{background:rgba(114,174,255,.12);color:var(--acc-gs);border:1px solid rgba(114,174,255,.2)}
+.cum-gp{background:rgba(46,232,150,.12);color:var(--acc-gp);border:1px solid rgba(46,232,150,.2)}
+.concierge-badge{display:inline-flex;align-items:center;gap:3px;font-family:'DM Mono',monospace;font-size:9px;padding:1px 6px;border-radius:3px;font-weight:600;background:rgba(160,128,255,.12);color:#A080FF;border:1px solid rgba(160,128,255,.2)}
+
+/* CATEGORY CHART */
+.chart-wrap{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:16px;margin-bottom:8px}
+.chart-title{font-size:12px;font-weight:600;color:var(--tx2);margin-bottom:12px}
+.chart-legend{display:flex;gap:16px;margin-bottom:10px;font-size:10px;color:var(--tx3)}
+.chart-legend span{display:flex;align-items:center;gap:4px}
+.chart-legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+
+/* CHANNEL CARDS */
+.ch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px}
+.chc{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
+.chc-name{font-size:10px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
+.chc-v{font-family:'Syne',sans-serif;font-size:20px;font-weight:700;letter-spacing:-.02em}
+.chc-sub{font-size:10px;color:var(--tx3);margin-top:2px}
+.chc-bar{height:3px;background:var(--bd2);border-radius:2px;margin-top:9px;overflow:hidden}
+.chc-barf{height:100%;border-radius:2px;transition:width .5s}
+
+/* SUMMARY SECTION */
+.sum-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:8px}
+.sum-card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
+.sum-label{font-size:10px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px}
+.sum-v{font-family:'Syne',sans-serif;font-size:18px;font-weight:700;letter-spacing:-.02em}
+.sum-sub{font-size:10px;color:var(--tx3);margin-top:3px}
+.sum-gp{font-size:11px;color:var(--A);margin-top:4px;font-weight:600}
+
+/* LOADING */
+.ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;
+  align-items:center;justify-content:center;flex-direction:column;gap:10px;backdrop-filter:blur(4px)}
+.ov.show{display:flex}
+.spi{width:26px;height:26px;border:2px solid var(--bd2);border-top-color:var(--A);border-radius:50%;animation:sp .7s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.ov-t{font-size:12px;color:var(--tx);background:var(--sf);padding:7px 16px;border-radius:20px;border:1px solid var(--bd2)}
+.empty{padding:28px;text-align:center;font-size:12px;color:var(--tx3)}
+@media(max-width:640px){h1{font-size:20px}.wrap{padding:16px 14px 40px}.cards{grid-template-columns:repeat(2,1fr)}table{font-size:11px}td,thead th{padding:5px 6px}}
+</style>
+</head>
+<body>
+<div class="ov" id="ov"><div class="spi"></div><div class="ov-t" id="ov-t">Loading...</div></div>
+
+<div class="wrap">
+  <div class="top">
+    <div>
+      <div class="brand-row">
+        <div class="brand-dot"></div>
+        <div><div class="brand-name">Equestrian Labs — Corro</div><div class="brand-sub">Pareto Sales Analysis · Shopify → Sheets · Gross Profit ranked · Gross Profit zones</div></div>
+      </div>
+      <h1>Pareto <span>Sales Analysis / Gross Profit</span></h1>
+      <div class="period-info" id="period-info">—</div>
+    </div>
+    <div class="controls">
+      <div class="sel-group">
+        <div class="sel-label">Year</div>
+        <select class="psel" id="sel-year" onchange="render()">
+          <option value="2026">2026</option>
+          <option value="2025" selected>2025</option>
+          <option value="2024">2024</option>
+        </select>
+      </div>
+      <div class="sel-group">
+        <div class="sel-label">Period</div>
+        <select class="psel" id="sel-type" onchange="render()">
+          <option value="full_year">Full Year</option>
+          <option value="q1">Q1 — Jan to Mar</option>
+          <option value="q2">Q2 — Apr to Jun</option>
+          <option value="q3">Q3 — Jul to Sep</option>
+          <option value="q4">Q4 — Oct to Dec</option>
+        </select>
+      </div>
+      <div class="divider-v"></div>
+      <button class="rfbtn" onclick="forceRefresh()">
+        <svg width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M10 6a4 4 0 1 1-.8-2.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M10 2v2.5H7.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Refresh
+      </button>
+      <button class="tbtn" onclick="toggleTheme()">☀</button>
+    </div>
+  </div>
+
+  <!-- METRIC DEFINITION — NEW: explains difference between metrics clearly -->
+  <div class="metric-def">
+    <strong>Net Sales</strong> = Gross Sales − Discounts &nbsp;·&nbsp;
+    <strong>Gross Profit</strong> = Net Sales − COGS (cost of goods) &nbsp;·&nbsp;
+    <em style="color:var(--tx3)">Products ranked by Net Sales · Pareto zones (A/B/C) assigned by cumulative Gross Profit</em>
+    <br><span class="formula">Pareto 80/20: Zone A = top products that generate 80% of Gross Profit, sorted by Gross Profit</span>
+  </div>
+
+  <!-- KPI CARDS — removed duplicate Gross Sales, kept Net Sales as primary -->
+  <div class="cards">
+    <div class="card"><div class="card-l">Net Sales</div><div class="card-v" id="s-rev">—</div><div class="card-s">After discounts</div></div>
+    <div class="card"><div class="card-l">Gross Profit</div><div class="card-v" id="s-gp">—</div><div class="card-s" id="s-gp-sub">Net Sales − COGS</div></div>
+    <div class="card"><div class="card-l">Total Orders</div><div class="card-v" id="s-ord">—</div></div>
+    <div class="card"><div class="card-l">Units Sold</div><div class="card-v" id="s-prod">—</div></div>
+    <div class="card"><div class="card-l">Pareto 80/20</div><div class="card-v" id="s-za">—</div><div class="card-s" id="s-za-sub">products = 80% Gross Profit</div></div>
+    <div class="card"><div class="card-l">Top GP Seller</div><div class="card-v" id="s-top1">—</div><div class="card-s" id="s-top1-name">of Gross Profit</div></div>
+    <div class="card"><div class="card-l">Updated</div><div class="card-v" style="font-size:13px;margin-top:2px" id="s-upd">—</div></div>
+  </div>
+
+  <div class="sec"><div class="sn">Overview</div><div class="sl"></div><div class="st">Cumulative revenue by zone</div></div>
+  <div class="cum-row" id="cum-bar"></div>
+  <div class="legend">
+    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-a)"></div>Zone A — 80% of Gross Profit (Top Sellers)</div>
+    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-b)"></div>Zone B — 80–95%</div>
+    <div class="leg-item"><div class="leg-dot" style="background:var(--bar-c)"></div>Zone C — tail</div>
+  </div>
+  <div class="insight" id="insight">Select a year and period above.</div>
+
+  <!-- PRODUCTS TABLE -->
+  <div class="sec"><div class="sn">01</div><div class="sl"></div><div class="st">By Product — all variants of same product grouped together</div></div>
+  <div class="tbl-wrap">
+    <div class="tbl-head">
+      <div class="tbl-title">Top Products by Net Sales</div>
+      <div class="tbl-note" id="prod-note">—</div>
+    </div>
+    <div id="tbl-products"><div class="empty">Select a period above</div></div>
+  </div>
+
+  <!-- CATEGORIES — now with parent-category grouping + chart -->
+  <div class="sec"><div class="sn">02</div><div class="sl"></div><div class="st">Revenue by Main Category — Tack & Equipment · Rider Apparel · Horse Care · Dogs · Stable & Other</div></div>
+
+  <!-- CATEGORY CHART (Gross Sales + Gross Profit side by side) -->
+  <div class="chart-wrap">
+    <div class="chart-title">Revenue by Main Category — Gross Sales vs Gross Profit</div>
+    <div class="chart-legend">
+      <span><i style="background:var(--acc-gs)"></i>Gross Sales</span>
+      <span><i style="background:var(--acc-gp)"></i>Gross Profit</span>
+    </div>
+    <div style="position:relative;width:100%;height:260px;">
+      <canvas id="cat-chart" role="img" aria-label="Bar chart of revenue by main category, comparing Gross Sales and Gross Profit">Category revenue data loading...</canvas>
+    </div>
+  </div>
+
+  <div id="cat-summary"><div class="empty">Loading...</div></div>
+  <div class="tbl-wrap" style="margin-top:8px">
+    <div class="tbl-head">
+      <div class="tbl-title">Revenue by Main Category</div>
+      <div class="tbl-note">Grouped by Shopify product_type · Tack & Equipment · Rider Apparel · Horse Care · Dogs · Stable & Other</div>
+    </div>
+    <div id="tbl-categories"><div class="empty">Select a period above</div></div>
+  </div>
+
+  <!-- CHANNELS -->
+  <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">Summary by Sales Channel</div></div>
+  <div id="ch-summary"><div class="empty">Loading...</div></div>
+  <div class="ch-grid" style="margin-top:8px" id="ch-grid"></div>
+
+  <!-- NEW VS RETURNING -->
+  <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">New vs Returning customers — revenue summary</div></div>
+  <div id="nvr-panel"></div>
+
+  <!-- TOP CUSTOMERS — now with GP% + Concierge tag -->
+  <div class="sec"><div class="sn">05</div><div class="sl"></div><div class="st">Top Customers — with Gross Profit contribution + Concierge tag</div></div>
+  <div class="tbl-wrap">
+    <div class="tbl-head">
+      <div class="tbl-title">Top 25 Customers by Net Sales</div>
+      <div class="tbl-note" id="cust-note">Zone A = strategic accounts</div>
+    </div>
+    <div id="tbl-customers"><div class="empty">Select a period above</div></div>
+  </div>
+
+  <div style="margin-top:22px;font-size:10px;color:var(--tx3);text-align:center">
+    Google Sheets ← pareto_v1.py ← Shopify API &nbsp;·&nbsp; Pareto 80/20 based on <strong style="color:var(--A)">Gross Profit</strong> &nbsp;·&nbsp; <span id="footer-lbl">—</span>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script>
+const SHEET_ID  = "1NnH7Ln3HP9AuJ5ohxgvVk6A5BnG9_iz9WPC9SxaaidI";
+const AKEY      = "AIzaSyBg5zCUgi9GPXw6c4W5DL2q12GbxLJTNws";
+
+let cache = {};
+let catChartInst = null;
+const $ = id => document.getElementById(id);
+
+function getPeriodKey(){
+  const y=$("sel-year").value, t=$("sel-type").value;
+  return t==="full_year" ? `full_year_${y}` : `${t}_${y}`;
+}
+function getPeriodLabel(){
+  const y=$("sel-year").value, t=$("sel-type").value;
+  const map={full_year:`Full Year ${y}`,q1:`Q1 ${y} (Jan–Mar)`,q2:`Q2 ${y} (Apr–Jun)`,q3:`Q3 ${y} (Jul–Sep)`,q4:`Q4 ${y} (Oct–Dec)`};
+  return map[t]||`${t} ${y}`;
+}
+
+// ── FORMAT ────────────────────────────────────────────────────────
+function fmt$(v){const n=parseFloat(v)||0;if(n>=1e6)return"$"+(n/1e6).toFixed(2)+"M";if(n>=1000)return"$"+(n/1000).toFixed(1)+"K";return"$"+Math.round(n).toLocaleString()}
+function fmtN(v){const n=parseInt(v)||0;if(n>=1000)return(n/1000).toFixed(1)+"K";return n.toLocaleString()}
+function fmtP(v){return(parseFloat(v)||0).toFixed(1)+"%"}
+function zCls(z){return z==="A"?"zA":z==="B"?"zB":"zC"}
+function zClr(z){return z==="A"?"var(--bar-a)":z==="B"?"var(--bar-b)":"var(--bar-c)"}
+function gpClr(gp){const n=parseFloat(gp)||0;return n<0?"var(--C)":n<20?"var(--B)":"var(--A)"}
+
+// ── CATEGORY GROUPING — maps Shopify product_type to 5 main categories ──
+// Source: Shopify AI / product_type export confirmed April 2026 (3,021 products)
+// Categories intentionally in English to match dashboard language.
+// NOTE: Dogs must be FIRST — "Dog > Supplements" contains "supplement" (Horse Care keyword)
+//       and "Dog > Treats & Accessories" contains "accessories" (Rider keyword).
+//       Checking Dogs first avoids those false matches.
+const CAT_KEYWORDS_ORDER = [
+  ["Dogs",                        ["dog"]],
+  ["Tack & Equipment",            ["bridle","rein","bridle accessories","saddle pad","all purpose","hunter/jumper","dressage saddle","half pad","stirrup","dressage bridle","belt"]],
+  ["Rider Apparel & Accessories", ["apparel","breeches","accessories","hat","shirt","schooling","leather handbag","handbag"]],
+  ["Horse Care",                  ["detangler","body brace","hoof care","poultice","liniment","relief spray","shampoo","fungal","skin & hair","supplement","personal care"]],
+  ["Stable & Other",              ["stall mat","stall & trailer","trailer cleaning","cavali club","spring 2024","special edition","_elite_gift","elite_gift"]],
+];
+// Also keep as object for color lookups
+const CAT_KEYWORDS = Object.fromEntries(CAT_KEYWORDS_ORDER);
+
+function getMainCategory(raw) {
+  // v1.2: raw is product_type from Shopify. Uses ordered array to avoid false matches
+  // (Dogs checked first so "Dog > Supplements" doesn't fall into Horse Care).
+  if (!raw) return "Uncategorized";
+  const low = raw.trim().toLowerCase();
+  for (const [cat, kws] of CAT_KEYWORDS_ORDER) {
+    if (kws.some(k => low.includes(k))) return cat;
+  }
+  return "Uncategorized";
+}
+
+// ── FETCH ─────────────────────────────────────────────────────────
+function parseCSV(text){
+  const rows=[];let row=[],field="",inQ=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i],nc=text[i+1];
+    if(inQ){if(c==='"'&&nc==='"'){field+='"';i++;}else if(c==='"'){inQ=false;}else{field+=c;}}
+    else{if(c==='"'){inQ=true;}else if(c===','){row.push(field);field="";}
+      else if(c==='\r'&&nc==='\n'){row.push(field);rows.push(row);row=[];field="";i++;}
+      else if(c==='\n'||c==='\r'){row.push(field);rows.push(row);row=[];field="";}
+      else{field+=c;}}
+  }
+  if(field||row.length){row.push(field);rows.push(row);}
+  return rows.filter(r=>r.some(c=>c.trim()!==""));
+}
+
+async function fetchTab(tab){
+  if(cache[tab]) return cache[tab];
+  const apiUrl=`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(tab)}?key=${AKEY}`;
+  try{
+    const r=await fetch(apiUrl);
+    if(r.ok){
+      const d=await r.json();
+      if(!d.error&&d.values&&d.values.length>=2){
+        const h=d.values[0];
+        const res=d.values.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=row[i]||"");return o;});
+        cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);return res;
+      }
+    }
+  }catch(e){console.warn(e);}
+  const csvUrl=`https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(tab)}`;
+  try{
+    const r=await fetch(csvUrl);if(!r.ok)return[];
+    const text=await r.text();if(!text||text.includes("<html"))return[];
+    const rows=parseCSV(text);if(rows.length<2)return[];
+    const h=rows[0];
+    const res=rows.slice(1).map(row=>{const o={};h.forEach((hh,i)=>o[hh]=(row[i]||"").trim());return o;});
+    cache[tab]=res;setTimeout(()=>delete cache[tab],5*60*1000);return res;
+  }catch(e){console.error(tab,e);return[];}
+}
+
+// Sort by gross_profit DESC (rank in Sheet may be stale from a previous net_sales run)
+function byPeriod(rows,pk){
+  return rows
+    .filter(r=>(r.period||"").trim()===pk)
+    .sort((a,b)=>parseFloat(b.gross_profit||0)-parseFloat(a.gross_profit||0));
+}
+function byPeriodNS(rows,pk){
+  // Channels and Customers still rank by net_sales (no GP field available)
+  return rows
+    .filter(r=>(r.period||"").trim()===pk)
+    .sort((a,b)=>parseFloat(b.net_sales||0)-parseFloat(a.net_sales||0));
+}
+
+// ── SUMMARY KPIs ──────────────────────────────────────────────────
+function renderSummary(fp){
+  if(!fp.length){["s-rev","s-gp","s-ord","s-prod","s-za","s-top1"].forEach(id=>$(id).textContent="—");return;}
+  const totalNS  = fp.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const totalGP  = fp.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0);
+  const totalOrd = fp.reduce((a,r)=>a+parseInt(r.orders||0),0);
+  const totalUnits = fp.reduce((a,r)=>a+parseInt(r.units||0),0);
+  const za = fp.filter(r=>r.pareto_zone==="A").length;
+  const gpPct = totalNS > 0 ? ((totalGP/totalNS)*100).toFixed(1) : "—";
+  $("s-rev").textContent = fmt$(totalNS);
+  $("s-gp").textContent  = fmt$(totalGP);
+  $("s-gp-sub").textContent = `${gpPct}% margin`;
+  $("s-ord").textContent = fmtN(totalOrd);
+  $("s-prod").textContent = fmtN(totalUnits);
+  $("s-za").textContent  = za;
+  $("s-top1").textContent = fmtP(fp[0]?.pct_gp||0);
+  $("s-top1-name").textContent = (fp[0]?.product_title||"").split(" ").slice(0,5).join(" ");
+  $("s-upd").textContent = (fp[0]?.updated_at||"").slice(0,10)||"—";
+}
+
+// ── PARETO BAR ────────────────────────────────────────────────────
+function renderCumBar(fp){
+  const bar=$("cum-bar");bar.innerHTML="";
+  if(!fp.length)return;
+  const z={A:0,B:0,C:0};
+  fp.forEach(r=>z[r.pareto_zone]=(z[r.pareto_zone]||0)+parseFloat(r.pct_revenue||0));
+  [["A","var(--bar-a)"],["B","var(--bar-b)"],["C","var(--bar-c)"]].forEach(([zn,c])=>{
+    const p=z[zn]||0;if(p<0.5)return;
+    const s=document.createElement("div");s.className="cum-seg";
+    s.style.cssText=`width:${p}%;background:${c}`;
+    s.title=`Zone ${zn}: ${p.toFixed(1)}% of revenue`;
+    s.textContent=p>8?`Zone ${zn} · ${p.toFixed(0)}%`:p>4?zn:"";
+    bar.appendChild(s);
+  });
+}
+
+// ── INSIGHT ───────────────────────────────────────────────────────
+function renderInsight(fp,fh,label){
+  if(!fp.length){$("insight").textContent="No data found. Run pareto_v1.py with this period first.";return;}
+  const za=fp.filter(r=>r.pareto_zone==="A");
+  const zaRev=za.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const zaGP =za.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0);
+  const top3=fp.slice(0,3).map(r=>`<strong>${(r.product_title||"").split(" ").slice(0,4).join(" ")}</strong>`).join(", ");
+  $("insight").innerHTML=`In <strong>${label}</strong>: <strong>${za.length} product${za.length!==1?"s":""}</strong> of ${fp.length} total
+    generate <strong>80% of Gross Profit</strong> (${fmt$(zaGP)} GP · ${fmt$(zaRev)} Net Sales).
+    Top sellers: ${top3}.
+    ${fh[0]?` &nbsp;·&nbsp; Top channel: <strong>${fh[0].channel}</strong> (${fmtP(fh[0].pct_revenue)}).`:""}
+    <br><em style="color:var(--tx3);font-size:11px">Ranked by Gross Profit · Zone assignment by cumulative Gross Profit (80% = Zone A)</em>`;
+}
+
+// ── PRODUCTS TABLE ────────────────────────────────────────────────
+function renderProducts(rows){
+  const el=$("tbl-products");
+  const pk=getPeriodKey();
+  const zaCount=rows.filter(r=>r.pareto_zone==="A").length;
+  $("prod-note").textContent=rows.length?`${rows.length} products · ${zaCount} in Zone A (80% Gross Profit)`:"No data";
+  if(!rows.length){el.innerHTML=`<div class="empty">No data. Run: python pareto_v1.py --only ${pk}</div>`;return;}
+
+  const totalNS = rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const totalGP = rows.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0);
+  let cumNS=0, cumGP=0;
+
+  const show=rows.slice(0,50);
+  el.innerHTML=`<table><thead><tr>
+    <th>#</th><th>Zone</th><th>Product</th>
+    <th class="r gp-col">Gross Profit</th>
+    <th class="r gp-col">GP%</th>
+    <th class="r gp-col">Cum. GP</th>
+    <th class="r">Net Sales</th>
+    <th class="r">% NS</th>
+    <th class="r">Cum. NS</th>
+    <th class="r">Units</th><th class="r">Orders</th><th>Top Channel</th>
+  </tr></thead><tbody>${show.map((r,i)=>{
+    cumNS += parseFloat(r.net_sales||0);
+    cumGP += parseFloat(r.gross_profit||0);
+    const pctNS    = totalNS>0 ? ((parseFloat(r.net_sales||0)/totalNS)*100).toFixed(1) : "0.0";
+    const cumNSpct = totalNS>0 ? ((cumNS/totalNS)*100).toFixed(1) : "0.0";
+    const cumGPpct = totalGP>0 ? ((cumGP/totalGP)*100).toFixed(1) : "0.0";
+    // Assign pareto zone dynamically based on re-sorted cumulative GP
+    const dynZone  = parseFloat(cumGPpct)<=80 ? "A" : parseFloat(cumGPpct)<=95 ? "B" : "C";
+    return `<tr>
+      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${i+1}</td>
+      <td><span class="zone ${zCls(dynZone)}">${dynZone}</span></td>
+      <td class="name">${r.product_title||"—"}<small>${getMainCategory(r.product_type||"")}</small></td>
+      <td class="r gp-sep" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
+      <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
+      <td class="r"><span class="cum-badge cum-gp">${cumGPpct}%</span></td>
+      <td class="r">${fmt$(r.net_sales)}</td>
+      <td class="r" style="font-family:'DM Mono',monospace">${pctNS}%</td>
+      <td class="r"><span class="cum-badge cum-gs">${cumNSpct}%</span></td>
+      <td class="r">${fmtN(r.units)}</td>
+      <td class="r">${fmtN(r.orders)}</td>
+      <td style="font-size:10px;color:var(--tx3)">${r.top_channel||"—"}</td>
+    </tr>`;
+  }).join("")}</tbody></table>
+  ${rows.length>50?`<div style="padding:9px 14px;font-size:10px;color:var(--tx3)">Showing top 50 of ${rows.length} products. Full list in Google Sheets.</div>`:""}`;
+}
+
+// ── BUILD CATEGORIES FROM ALL PRODUCTS (product_type field) ──────
+// v1.2: replaces pareto_categories sheet which had stale collection-path data.
+// Aggregates every product row in the period using getMainCategory(product_type).
+function buildCatsFromProducts(productRows) {
+  const groups = {};
+  productRows.forEach(r => {
+    const cat = getMainCategory(r.product_type || "");
+    if (!groups[cat]) groups[cat] = {
+      category: cat, gross_sales: 0, net_sales: 0, gross_profit: 0,
+      cogs: 0, units: 0, orders: 0
+    };
+    const g = groups[cat];
+    g.gross_sales  += parseFloat(r.gross_sales||0);
+    g.net_sales    += parseFloat(r.net_sales||0);
+    g.gross_profit += parseFloat(r.gross_profit||0);
+    g.cogs         += parseFloat(r.cogs||0);
+    g.units        += parseInt(r.units||0);
+    g.orders       += parseInt(r.orders||0);
+  });
+  Object.values(groups).forEach(g => {
+    g.gp_pct = g.net_sales > 0 ? ((g.gross_profit / g.net_sales) * 100).toFixed(1) : "0.0";
+  });
+  // Sort by Gross Profit DESC
+  return Object.values(groups).sort((a,b) => b.gross_profit - a.gross_profit);
+}
+
+// ── CATEGORY GROUPING + CHART + TABLE ────────────────────────────
+function groupByMainCategory(rows) {
+  // Group raw category rows into 5-7 main categories
+  const groups = {};
+  rows.forEach(r => {
+    const main = getMainCategory(r.category || "");
+    if (!groups[main]) groups[main] = {
+      category: main, gross_sales: 0, net_sales: 0, gross_profit: 0,
+      cogs: 0, units: 0, orders: 0, gp_pct: 0
+    };
+    const g = groups[main];
+    g.gross_sales   += parseFloat(r.gross_sales||0);
+    g.net_sales     += parseFloat(r.net_sales||0);
+    g.gross_profit  += parseFloat(r.gross_profit||0);
+    g.cogs          += parseFloat(r.cogs||0);
+    g.units         += parseInt(r.units||0);
+    g.orders        += parseInt(r.orders||0);
+  });
+  // Compute GP%
+  Object.values(groups).forEach(g => {
+    g.gp_pct = g.net_sales > 0 ? ((g.gross_profit / g.net_sales) * 100).toFixed(1) : "0.0";
+  });
+  return Object.values(groups).sort((a,b) => b.gross_profit - a.gross_profit); // v1.2: sort by GP
+}
+
+const CAT_COLORS = {
+  "Tack & Equipment":             "#72AEFF",
+  "Rider Apparel & Accessories":  "#2EE896",
+  "Horse Care":                   "#D8B054",
+  "Dogs":                         "#F06868",
+  "Stable & Other":               "#A090FF",
+  "Uncategorized":                "#72706A",
+};
+
+function renderCategoryChart(grouped) {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const labels = grouped.map(g => g.category);
+  const gsData = grouped.map(g => Math.round(g.gross_sales));
+  const gpData = grouped.map(g => Math.round(g.gross_profit));
+
+  const gsColor = isDark ? '#72AEFF' : '#1450A8';
+  const gpColor = isDark ? '#2EE896' : '#0C7050';
+  const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
+  const textColor = isDark ? '#72706A' : '#8E8C85';
+
+  if (catChartInst) { catChartInst.destroy(); catChartInst = null; }
+
+  catChartInst = new Chart(document.getElementById('cat-chart'), {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        {
+          label: 'Gross Sales',
+          data: gsData,
+          backgroundColor: gsColor + '99',
+          borderColor: gsColor,
+          borderWidth: 1,
+          borderRadius: 4,
+        },
+        {
+          label: 'Gross Profit',
+          data: gpData,
+          backgroundColor: gpColor + '99',
+          borderColor: gpColor,
+          borderWidth: 1,
+          borderRadius: 4,
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` ${ctx.dataset.label}: $${ctx.parsed.y.toLocaleString()}`
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: textColor, font: { size: 11 }, autoSkip: false },
+          grid: { color: gridColor }
+        },
+        y: {
+          ticks: {
+            color: textColor,
+            font: { size: 10 },
+            callback: v => v >= 1000 ? '$' + (v/1000).toFixed(0) + 'K' : '$' + v
+          },
+          grid: { color: gridColor }
+        }
+      }
+    }
+  });
+}
+
+function renderCategories(grouped) {
+  // v1.2: receives already-grouped array from buildCatsFromProducts() — no re-grouping needed
+
+  // Render chart
+  renderCategoryChart(grouped);
+
+  // Summary cards
+  const sumEl = $("cat-summary");
+  const totalNS = grouped.reduce((a,g)=>a+g.net_sales,0)||1;
+  const totalGP = grouped.reduce((a,g)=>a+g.gross_profit,0)||1;
+  sumEl.innerHTML = `<div class="sum-grid">${grouped.map(g => {
+    const pctNS = ((g.net_sales/totalNS)*100).toFixed(1);
+    const pctGP = ((g.gross_profit/totalGP)*100).toFixed(1);
+    const clr = CAT_COLORS[g.category] || "#888";
+    return `<div class="sum-card" style="border-top:2px solid ${clr}">
+      <div class="sum-label" style="color:${clr}">${g.category}</div>
+      <div class="sum-v">${fmt$(g.net_sales)}</div>
+      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(g.units)} units</div>
+      <div class="sum-gp">GP: ${fmt$(g.gross_profit)} · ${g.gp_pct}% margin · ${pctGP}% of total GP</div>
+    </div>`;
+  }).join("")}</div>`;
+
+  // Table
+  const el = $("tbl-categories");
+  if (!grouped.length) { el.innerHTML = `<div class="empty">No data.</div>`; return; }
+  let cumNS = 0, cumGP = 0;
+  el.innerHTML = `<table><thead><tr>
+    <th>#</th><th>Main Category</th>
+    <th class="r">Net Sales</th>
+    <th class="r">% of Total</th>
+    <th class="r">Cum. NS</th>
+    <th class="r gp-col">Gross Profit</th>
+    <th class="r gp-col">GP%</th>
+    <th class="r gp-col">Cum. GP</th>
+    <th class="r">Units</th><th class="r">Orders</th>
+  </tr></thead><tbody>${grouped.map((g,i) => {
+    cumNS += g.net_sales;
+    cumGP += g.gross_profit;
+    const pctNS   = ((g.net_sales/totalNS)*100).toFixed(1);
+    const cumNSpct = ((cumNS/totalNS)*100).toFixed(1);
+    const cumGPpct = ((cumGP/totalGP)*100).toFixed(1);
+    const clr = CAT_COLORS[g.category] || "#888";
+    return `<tr>
+      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${i+1}</td>
+      <td class="name" style="color:${clr};font-weight:600">${g.category}</td>
+      <td class="r">${fmt$(g.net_sales)}</td>
+      <td class="r" style="font-family:'DM Mono',monospace">${pctNS}%</td>
+      <td class="r"><span class="cum-badge cum-gs">${cumNSpct}%</span></td>
+      <td class="r gp-sep" style="color:${gpClr(g.gp_pct)};font-weight:500">${fmt$(g.gross_profit)}</td>
+      <td class="r" style="color:${gpClr(g.gp_pct)};font-family:'DM Mono',monospace">${g.gp_pct}%</td>
+      <td class="r"><span class="cum-badge cum-gp">${cumGPpct}%</span></td>
+      <td class="r">${fmtN(g.units)}</td>
+      <td class="r">${fmtN(g.orders)}</td>
+    </tr>`;
+  }).join("")}</tbody></table>`;
+}
+
+// ── CHANNEL SUMMARY + CARDS ───────────────────────────────────────
+const CH_COLORS={"Wellington (POS)":"#D8B054","Concierge":"#A090FF","Online (Ecom)":"#72AEFF","Others":"#888"};
+function renderChannels(rows){
+  const sumEl=$("ch-summary");
+  const el=$("ch-grid");el.innerHTML="";
+  if(!rows.length){sumEl.innerHTML="";el.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
+  const totalNS=rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
+  sumEl.innerHTML=`<div class="sum-grid">${rows.map(r=>{
+    const c=CH_COLORS[r.channel]||"#888";
+    const pctNS=((parseFloat(r.net_sales||0)/totalNS)*100).toFixed(1);
+    return `<div class="sum-card"><div class="sum-label" style="color:${c}">${r.channel}</div>
+      <div class="sum-v" style="color:${c}">${fmt$(r.net_sales)}</div>
+      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(r.orders)} orders</div></div>`;
+  }).join("")}</div>`;
+  rows.forEach(r=>{
+    const c=CH_COLORS[r.channel]||"#888";
+    const d=document.createElement("div");d.className="chc";
+    d.innerHTML=`<div class="chc-name">${r.channel}</div>
+      <div class="chc-v" style="color:${c}">${fmt$(r.net_sales)}</div>
+      <div class="chc-sub">${fmtP(r.pct_revenue)} &nbsp;·&nbsp; ${fmtN(r.orders)} orders &nbsp;·&nbsp; ${fmtN(r.units)} units</div>
+      <div class="chc-bar"><div class="chc-barf" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${c}"></div></div>`;
+    el.appendChild(d);
+  });
+}
+
+// ── NEW VS RETURNING ──────────────────────────────────────────────
+function renderNVR(rows){
+  const el=$("nvr-panel");if(!el)return;
+  if(!rows.length){el.innerHTML=`<div class="empty" style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px">No data. Run pipeline first.</div>`;return;}
+  el.innerHTML=`<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px">${rows.map(r=>{
+    const isNew=(r.segment||"").toLowerCase()==="new";
+    const clr=isNew?"var(--A)":"var(--B)";
+    return `<div style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px;padding:14px 16px">
+      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);margin-bottom:6px">${r.segment} Customers</div>
+      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;color:${clr}">${fmt$(r.net_sales)}</div>
+      <div style="font-size:11px;color:var(--tx3);margin-top:3px">${fmtP(r.pct_revenue)} of revenue &nbsp;·&nbsp; ${fmtN(r.customers)} customers &nbsp;·&nbsp; ${fmtN(r.orders)} orders</div>
+      <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:10px;overflow:hidden">
+        <div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${clr}"></div>
+      </div></div>`;
+  }).join("")}</div>`;
+}
+
+// ── CUSTOMERS TABLE — with GP% + Concierge tag ────────────────────
+function segBadge(s){const new_=s==="New";return `<span style="font-size:9px;padding:1px 6px;border-radius:20px;background:${new_?"var(--A-bg)":"var(--B-bg)"};color:${new_?"var(--A)":"var(--B)"};border:.5px solid ${new_?"var(--A-bd)":"var(--B-bd)"}">${s||"—"}</span>`}
+
+function renderCustomers(rows, allProducts){
+  const el=$("tbl-customers");
+  if(!rows.length){el.innerHTML=`<div class="empty">No data.</div>`;return;}
+
+  // Calculate total GP from all products for the period
+  const totalGP = allProducts.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0)||1;
+  const totalNS = rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
+  // Top 50 GP sum — estimate based on NS ratio (actual GP per customer not in customers sheet)
+  const top50NS = rows.slice(0,50).reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const top50pct = ((top50NS/totalNS)*100).toFixed(1);
+  $("cust-note").textContent = `Top 50 = ${top50pct}% of Net Sales · Zone A = strategic accounts`;
+
+  el.innerHTML=`<table><thead><tr>
+    <th>#</th><th>Zone</th><th>Customer</th><th>Segment</th><th>Concierge</th>
+    <th class="r">Net Sales</th><th class="r">% Revenue</th><th class="r">Cumulative</th>
+    <th class="r">Orders</th><th class="r">Units</th><th>Last Order</th>
+  </tr></thead><tbody>${rows.slice(0,50).map(r => {
+    // Detect concierge tag — field 'tags' or infer from channel
+    const hasConcierge = (r.tags || r.top_channel || r.channel || "").toLowerCase().includes("concierge");
+    const conciergeCell = hasConcierge
+      ? `<span class="concierge-badge">Concierge</span>`
+      : `<span style="font-size:9px;color:var(--tx3)">—</span>`;
+    return `<tr>
+      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
+      <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
+      <td class="name">${r.name||"Guest"}<small>${r.email||""}</small></td>
+      <td>${segBadge(r.segment)}</td>
+      <td>${conciergeCell}</td>
+      <td class="r">${fmt$(r.net_sales)}</td>
+      <td class="r"><div class="bar-wrap"><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${zClr(r.pareto_zone)}"></div></div><span class="bar-pct">${fmtP(r.pct_revenue)}</span></div></td>
+      <td class="r" style="font-family:'DM Mono',monospace">${fmtP(r.cum_pct)}</td>
+      <td class="r">${r.orders}</td>
+      <td class="r">${fmtN(r.units)}</td>
+      <td style="font-size:10px;color:var(--tx3)">${r.last_order||"—"}</td>
+    </tr>`;
+  }).join("")}</tbody></table>
+  <div style="padding:10px 14px;font-size:10px;color:var(--tx3);border-top:1px solid var(--bd)">
+    Top 50 customers = <strong style="color:var(--tx2)">${top50pct}% of Net Sales</strong> &nbsp;·&nbsp;
+    <em>Concierge tag is detected from customer channel data in Shopify</em>
+  </div>`;
+}
+
+// ── MAIN RENDER ───────────────────────────────────────────────────
+async function render(){
+  const pk=getPeriodKey(), label=getPeriodLabel();
+  $("ov").classList.add("show");
+  $("ov-t").textContent=`Loading ${label}...`;
+  $("period-info").textContent=label;
+  $("footer-lbl").textContent=label;
+
+  const [products,categories,channels,customers,nvr]=await Promise.all([
+    fetchTab("pareto_products"),fetchTab("pareto_categories"),
+    fetchTab("pareto_channels"),fetchTab("pareto_customers"),
+    fetchTab("pareto_new_vs_ret"),
+  ]);
+
+  const fp=byPeriod(products,pk), fc=byPeriod(categories,pk);
+  const fh=byPeriodNS(channels,pk), fcu=byPeriodNS(customers,pk);
+  const fnvr=byPeriod(nvr,pk);
+
+  // v1.2: Rebuild categories directly from product_type field of ALL products in this period.
+  // This ensures ALL products are counted (not just the ~7 that old collection sheet had).
+  // pareto_categories sheet may be stale — product-level data is always fresh.
+  const fcFromProducts = buildCatsFromProducts(fp);
+
+  if(fp[0]?.period_start)
+    $("period-info").textContent=`${label} · ${fp[0].period_start} → ${fp[0].period_end}`;
+
+  renderSummary(fp);
+  renderCumBar(fp);
+  renderInsight(fp,fh,label);
+  renderProducts(fp);
+  renderCategories(fcFromProducts);
+  renderChannels(fh);
+  renderNVR(fnvr);
+  renderCustomers(fcu, fp);
+
+  $("ov").classList.remove("show");
+}
+
+function forceRefresh(){cache={};render();}
+function toggleTheme(){
+  const h=document.documentElement,dk=h.getAttribute("data-theme")==="dark";
+  h.setAttribute("data-theme",dk?"light":"dark");
+  document.querySelector(".tbtn").textContent=dk?"☀":"☾";
+  // Re-render chart with updated colors
+  if(catChartInst){ catChartInst.destroy(); catChartInst=null; }
+  render();
+}
+
+document.getElementById("sel-type").value="full_year";
+render();
+</script>
+</body>
+</html>
