@@ -315,11 +315,23 @@ def fetch_shopifyql_sales(start, end):
 
     def run_shopifyql(q):
         """Run a ShopifyQL query, return (cols, rows, errors)."""
-        d      = shopify_graphql(GQL, {"q": q})
-        errs   = (d.get("data") or {}).get("shopifyqlQuery", {}).get("parseErrors") or []
-        table  = (d.get("data") or {}).get("shopifyqlQuery", {}).get("tableData") or {}
-        cols   = [c["name"] for c in table.get("columns", [])]
-        rows   = table.get("rows") or []
+        d = shopify_graphql(GQL, {"q": q})
+        # Log full response for debugging — helps diagnose scope/auth issues
+        raw_errors  = d.get("errors")  # top-level GraphQL errors (auth, scope)
+        shopifyql_q = (d.get("data") or {}).get("shopifyqlQuery")
+        if raw_errors:
+            print(f"  ✗ GraphQL errors (likely missing scope): {raw_errors}")
+        if shopifyql_q is None:
+            print(f"  ✗ shopifyqlQuery is null — token missing read_reports scope")
+            print(f"    Full response: {str(d)[:500]}")
+            return [], [], [{"code": "NULL_RESPONSE", "message": "shopifyqlQuery returned null"}]
+        errs  = shopifyql_q.get("parseErrors") or []
+        table = shopifyql_q.get("tableData") or {}
+        cols  = [c["name"] for c in (table.get("columns") or [])]
+        rows  = table.get("rows") or []
+        if errs:
+            print(f"  ⚠ parseErrors: {errs}")
+        print(f"    → cols={cols}  rows={len(rows)}")
         return cols, rows, errs
 
     # ── Query 1: product financials ───────────────────────────────────
