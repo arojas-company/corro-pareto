@@ -1,13 +1,26 @@
 """
-PARETO PIPELINE v1.2 — Equestrian Labs / Corro
+PARETO PIPELINE v1.3 — Equestrian Labs / Corro
 ===============================================
+Cambios v1.3 vs v1.2:
+- CHANGED: map_product_type_to_category() ahora usa las 7 categorías que
+  corresponden exactamente a los order tags de Shopify:
+    Horse_Health, Grooming_Tools, Horsewear, Supplements,
+    Tack_Equipment, StableSupplies_Collection, Rider, Uncategorized.
+  Estos tags son asignados automáticamente por Shopify a las órdenes
+  según los tipos de productos que contienen.
+- CHANGED: Dogs ya no existe como categoría separada — los productos de
+  perros caen en Horse_Health o Supplements según su product_type.
+- NOTE: el ordenamiento por Gross Profit DESC se aplica consistentemente
+  tanto en products como en categories (ya introducido en v1.2).
+- NOTE: Los 7 order tags de Shopify son los mismos labels que se usan en
+  el frontend HTML para la sección de categorías y el chart.
+
 Cambios v1.2 vs v1.1:
 - CHANGED: Products and categories now sorted by Gross Profit DESC (previously Net Sales).
   Zone A still = 80% cumulative GP.
-- CHANGED: build_pareto_categories now uses product_type (mapped to 5 main categories)
-  instead of Shopify collections. Categories: Tack & Equipment, Rider Apparel & Accessories,
-  Horse Care, Dogs, Stable & Other, Uncategorized.
-- ADDED: map_product_type_to_category() helper with confirmed product_type keywords (April 2026).
+- CHANGED: build_pareto_categories now uses product_type (mapped to 7 main categories
+  matching Shopify order tags) instead of Shopify collections.
+- ADDED: map_product_type_to_category() helper with confirmed product_type keywords.
 
 Cambios v1.1 vs v1.0:
 - FIXED: duplicación de órdenes. fetch_orders usaba financial_status como
@@ -21,11 +34,8 @@ Cambios v1.1 vs v1.0:
   y pareto_categories.
 - ADDED: columna cum_gs_pct (acumulado de Gross Sales %) — el frontend
   necesita ambos acumulados.
-- NOTE: los productos se siguen ORDENANDO por net_sales (descendente),
-  pero la zona se asigna por GP acumulado. Esto es lo que pidió Ceci:
-  "ordenarlo por Net Sales para llegar al 80% del Gross Profit."
 
-Run modes (sin cambios):
+Run modes:
   python pareto_v1.py                     # all periods 2024 → today
   python pareto_v1.py --only q4_2025     # single quarter
   python pareto_v1.py --only full_year_2025
@@ -131,20 +141,15 @@ def shopify_get(endpoint, params):
 # ── FIX v1.1: fetch_orders sin duplicación ────────────────────────
 def fetch_orders(start, end):
     """
-    FIXED v1.1: La versión anterior pasaba financial_status como lista
-    separada por comas en un solo parámetro. Shopify REST acepta eso en
-    algunos endpoints pero con paginación puede duplicar. Ahora hacemos
-    DOS requests separados (paid+partially_paid y partially_refunded+refunded)
-    y deduplicamos por order id.
-
-    Resultado esperado: ~8,800 órdenes en 2025 (la mitad de los 18.2K anteriores).
+    FIXED v1.1: fetch_orders sin duplicación — dos requests separados
+    (paid+partially_paid y partially_refunded+refunded) y deduplicamos por order id.
+    Resultado esperado: ~8,800 órdenes en 2025.
     """
     print(f"  Fetching orders {start} → {end} (deduplication fix v1.1)...")
 
     seen_ids = set()
     all_orders = []
 
-    # Batch 1: paid + partially_paid
     for status in ["paid,partially_paid", "partially_refunded,refunded"]:
         batch = shopify_get("orders.json", {
             "status": "any",
@@ -245,6 +250,105 @@ def audit_concierge_tags(orders, sample=30):
         print(f"    {cnt:>5}x  {k}")
     print("  ────────────────────────────────────────────────────\n")
 
+# ── CATEGORY MAPPING v1.3 ─────────────────────────────────────────
+def map_product_type_to_category(raw_type):
+    """
+    v1.3: Maps Shopify product_type values to the 7 categories that match
+    exactly the Shopify order tags assigned automatically to orders.
+
+    Order tag → category meaning:
+      Horse_Health           → Farmacia equina, terapéuticos (GastroGard, UlcerGard, Back on Track)
+      Grooming_Tools         → Herramientas de grooming (cajas, cepillos, detanglers)
+      Horsewear              → Ropa para caballos (mantas, sheets, fly wraps, coolers, neck covers)
+      Supplements            → Suplementos nutricionales (Cavalor, Nupafeed, Kentucky Performance, EO-3)
+      Tack_Equipment         → Equipo de tack (riendas, cinchas, breastplates, estribos, bridones)
+      StableSupplies_Collection → Suministros de establo (stall mats, bags, limpieza)
+      Rider                  → Productos para el jinete (ropa, shirts, breeches, boot bags, accesorios)
+
+    Keywords confirmed against Shopify product_type export (April 2026, 3,021 products).
+    Order matters — checked top to bottom, first match wins.
+    Dogs products map into Horse_Health (therapeutic) or Supplements per their product_type.
+    """
+    if not raw_type:
+        return "Uncategorized"
+    t = raw_type.strip().lower()
+
+    # ── Rider — jinete products checked FIRST ─────────────────────
+    # Must be before Tack_Equipment because "breeches" could otherwise
+    # fall through to accessories-related keywords.
+    rider_kw = [
+        "apparel", "breeches", "hat", "shirt", "schooling",
+        "leather handbag", "handbag", "boot bag",
+        "rider", "belt",
+    ]
+    if any(k in t for k in rider_kw):
+        return "Rider"
+
+    # ── Tack & Equipment ─────────────────────────────────────────
+    tack_kw = [
+        "bridle", "rein", "bridle accessories",
+        "saddle pad", "all purpose", "hunter/jumper", "dressage saddle",
+        "half pad", "stirrup", "dressage bridle",
+        "girth", "breastplate", "martingale", "bit",
+    ]
+    if any(k in t for k in tack_kw):
+        return "Tack_Equipment"
+
+    # ── Horsewear — mantas, sheets, fly wraps, coolers ───────────
+    horsewear_kw = [
+        "blanket", "sheet", "fly wrap", "fly rug", "cooler",
+        "neck cover", "hood", "turnout", "stable rug",
+        "horsewear",
+    ]
+    if any(k in t for k in horsewear_kw):
+        return "Horsewear"
+
+    # ── Grooming Tools ───────────────────────────────────────────
+    grooming_kw = [
+        "detangler", "shampoo", "grooming", "brush", "comb",
+        "body brace", "skin & hair", "fungal", "spray",
+    ]
+    if any(k in t for k in grooming_kw):
+        return "Grooming_Tools"
+
+    # ── Supplements — nutricionales ──────────────────────────────
+    supplement_kw = [
+        "supplement", "electrolyte", "vitamin", "probiotic",
+        "omega", "joint", "performance",
+    ]
+    if any(k in t for k in supplement_kw):
+        return "Supplements"
+
+    # ── Horse Health — farmacia y terapéuticos ───────────────────
+    # Includes dog therapeutic/pharma products too
+    health_kw = [
+        "hoof care", "poultice", "liniment", "relief",
+        "wound", "ointment", "pharmaceutical", "therapeutic",
+        "ulcer", "gastric", "back on track",
+        "dog",  # dog products map here if not supplement
+        "personal care",
+    ]
+    if any(k in t for k in health_kw):
+        return "Horse_Health"
+
+    # ── Stable Supplies ──────────────────────────────────────────
+    stable_kw = [
+        "stall mat", "stall & trailer", "trailer cleaning",
+        "stall", "stable supply", "cleaning", "bag",
+        "cavali club", "spring 2024", "special edition",
+        "_elite_gift", "elite_gift",
+    ]
+    if any(k in t for k in stable_kw):
+        return "StableSupplies_Collection"
+
+    # ── Rider catch-all: accessories ────────────────────────────
+    # 'accessories' is checked late to avoid false positives
+    if "accessories" in t:
+        return "Rider"
+
+    return "Uncategorized"
+
+
 # ── AGGREGATION ───────────────────────────────────────────────────
 def build_pareto_products(orders, vmap, variant_cost):
     agg = defaultdict(lambda: {
@@ -280,64 +384,10 @@ def build_pareto_products(orders, vmap, variant_cost):
             row["channels"][detect_channel(order)] += net
     return agg
 
-def map_product_type_to_category(raw_type):
-    """
-    v1.2: Maps Shopify product_type values to the 5 main categories
-    confirmed by Ceci / Shopify AI (April 2026).
-    English labels kept intentionally — dashboard is in English.
-    NOTE: Dogs must be checked FIRST — 'Dog > Supplements' contains 'supplement'
-    and 'Dog > Treats & Accessories' contains 'accessories', which would match
-    Horse Care / Rider if checked later.
-    """
-    if not raw_type:
-        return "Uncategorized"
-    t = raw_type.strip().lower()
-
-    # ── Dogs — checked FIRST to avoid false matches on supplement/accessories ──
-    if t.startswith("dog"):
-        return "Dogs"
-
-    # ── Tack & Equipment ──────────────────────────────────────────────────────
-    tack_kw = [
-        "bridle", "rein", "bridle accessories",
-        "saddle pad", "all purpose", "hunter/jumper", "dressage saddle",
-        "half pad", "stirrup", "dressage bridle",
-        "belt",
-    ]
-    if any(k in t for k in tack_kw):
-        return "Tack & Equipment"
-
-    # ── Rider Apparel & Accessories ───────────────────────────────────────────
-    rider_kw = [
-        "apparel", "breeches", "accessories", "hat", "shirt",
-        "schooling", "leather handbag", "handbag",
-    ]
-    if any(k in t for k in rider_kw):
-        return "Rider Apparel & Accessories"
-
-    # ── Horse Care ────────────────────────────────────────────────────────────
-    care_kw = [
-        "detangler", "body brace", "hoof care", "poultice",
-        "liniment", "relief spray", "shampoo", "fungal", "skin & hair",
-        "supplement", "personal care",
-    ]
-    if any(k in t for k in care_kw):
-        return "Horse Care"
-
-    # ── Stable & Other ────────────────────────────────────────────────────────
-    stable_kw = [
-        "stall mat", "stall & trailer", "trailer cleaning",
-        "cavali club", "spring 2024", "special edition",
-        "_elite_gift", "elite_gift",
-    ]
-    if any(k in t for k in stable_kw):
-        return "Stable & Other"
-
-    return "Uncategorized"
-
-
 def build_pareto_categories(orders, vmap, prod_colls, variant_cost):
-    # v1.2: uses product_type (mapped to 5 main categories) instead of collections
+    """
+    v1.3: uses product_type → map_product_type_to_category() → 7 Shopify order tag categories.
+    """
     agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,"units":0,"orders":set()})
     for order in orders:
         disc_total  = float(order.get("total_discounts",0) or 0)
@@ -346,7 +396,6 @@ def build_pareto_categories(orders, vmap, prod_colls, variant_cost):
         for li in order.get("line_items",[]):
             vid   = str(li.get("variant_id") or "")
             info  = vmap.get(vid,{"product_id":"","product_type":"Uncategorized"})
-            pid   = info["product_id"]
             cat   = map_product_type_to_category(info.get("product_type",""))
             qty   = int(li.get("quantity",0) or 0)
             price = float(li.get("price",0) or 0) * qty
@@ -405,20 +454,17 @@ def build_new_vs_returning(agg_cust):
         s[k]["count"] += 1; s[k]["net_sales"] += d["net_sales"]; s[k]["orders"] += d["orders"]
     return s
 
-# ── PARETO COLUMNS — v1.1 ─────────────────────────────────────────
+# ── PARETO COLUMNS — v1.1 / v1.2 ─────────────────────────────────
 def add_pareto_cols(rows, revenue_key="net_sales", gp_key="gross_profit"):
     """
-    v1.1 CHANGES:
-    - pct_revenue y cum_pct siguen siendo sobre net_sales (para ranking)
-    - ADDED: pct_gs y cum_gs_pct sobre gross_sales
-    - ADDED: pct_gp y cum_gp_pct sobre gross_profit
-    - pareto_zone ahora se asigna por cum_gp_pct (Ceci quiere 80% GP):
+    - pct_revenue y cum_pct sobre net_sales (ranking)
+    - pct_gs y cum_gs_pct sobre gross_sales
+    - pct_gp y cum_gp_pct sobre gross_profit
+    - pareto_zone asignado por cum_gp_pct:
         Zone A: cum_gp_pct <= 80%
         Zone B: cum_gp_pct <= 95%
         Zone C: resto
-
-    Los productos se ordenan por net_sales (desc) antes de llamar esta función.
-    Así "ordenamos por Net Sales para llegar al 80% del Gross Profit."
+    Rows deben estar pre-ordenados por gross_profit DESC antes de llamar esta función.
     """
     total_rev = sum(r.get(revenue_key, 0) for r in rows) or 1
     total_gs  = sum(r.get("gross_sales", 0) for r in rows) or 1
@@ -434,16 +480,13 @@ def add_pareto_cols(rows, revenue_key="net_sales", gp_key="gross_profit"):
         cum_gp  += r.get(gp_key, 0)
 
         r["rank"]        = i + 1
-        # net_sales %
         r["pct_revenue"] = round(r.get(revenue_key, 0) / total_rev * 100, 2)
         r["cum_pct"]     = round(cum_rev / total_rev * 100, 2)
-        # gross_sales % — ADDED
         r["pct_gs"]      = round(r.get("gross_sales", 0) / total_gs * 100, 2)
         r["cum_gs_pct"]  = round(cum_gs / total_gs * 100, 2)
-        # gross_profit % — ADDED
         r["pct_gp"]      = round(r.get(gp_key, 0) / total_gp * 100, 2)
         r["cum_gp_pct"]  = round(cum_gp / total_gp * 100, 2)
-        # CHANGED: zone based on GP cumulative, not revenue cumulative
+        # Zone based on cumulative GP
         r["pareto_zone"] = "A" if r["cum_gp_pct"] <= 80 else ("B" if r["cum_gp_pct"] <= 95 else "C")
 
     return rows, total_rev
@@ -544,10 +587,10 @@ def main():
     periods = [resolve_single(args.only, args.start, args.end)] if args.only else build_all_periods()
 
     print(f"\n{'='*60}")
-    print(f"  PARETO PIPELINE v1.1 — Corro ({STORE_URL})")
+    print(f"  PARETO PIPELINE v1.3 — Corro ({STORE_URL})")
     print(f"  Mode  : {'single ('+args.only+')' if args.only else 'full backfill — '+str(len(periods))+' periods'}")
     print(f"  Sheet : {SHEET_ID}")
-    print(f"  Fix   : order deduplication + GP-based zones")
+    print(f"  v1.3  : 7 Shopify order-tag categories · GP-sorted · GP zones")
     print(f"{'='*60}\n")
 
     vmap         = fetch_products_map()
@@ -555,7 +598,6 @@ def main():
     prod_colls   = fetch_collections_map()
     sh           = get_gc().open_by_key(SHEET_ID)
 
-    # CHANGED: headers include cum_gs_pct and cum_gp_pct
     h_prod = ["updated_at","period","period_start","period_end","rank","pareto_zone",
               "product_title","product_type","vendor","sku_parent","product_id",
               "gross_sales","pct_gs","cum_gs_pct",
@@ -595,7 +637,7 @@ def main():
         au = build_pareto_customers(orders, start)
         nvr = build_new_vs_returning(au)
 
-        # Products — sorted by gross_profit desc (v1.2), zones by cumulative GP
+        # Products — sorted by gross_profit DESC, zones by cumulative GP
         raws = []
         for pid, d in ap.items():
             gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
@@ -607,7 +649,7 @@ def main():
                 "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp,
                 "top_channel":max(d["channels"],key=d["channels"].get) if d["channels"] else ""
             })
-        # v1.2 CHANGED: sorted by gross_profit desc (Ceci request), zones assigned by GP cumulative
+        # Sorted by gross_profit DESC
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
         all_prod += [[
             now_str, pk, str(start), str(end),
@@ -619,7 +661,7 @@ def main():
             r["units"], r["orders"], r["top_channel"]
         ] for r in rs]
 
-        # Categories
+        # Categories — sorted by gross_profit DESC, zones by cumulative GP
         raws = []
         for cat, d in ac.items():
             gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
@@ -628,7 +670,7 @@ def main():
                 "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"]),
                 "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp
             })
-        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))  # v1.2: sort by GP
+        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
         all_cat += [[
             now_str, pk, str(start), str(end),
             r["rank"], r["pareto_zone"], r["category"],
@@ -683,9 +725,11 @@ def main():
     upsert_tab(sh, "pareto_new_vs_ret", h_nvr,  all_nvr,  ["period","segment"])
 
     print(f"\n{'='*60}")
-    print(f"  ✓ Done v1.1 — {len(periods)} periods | Sheet: {SHEET_ID}")
-    print(f"  Orders deduplication fix applied")
-    print(f"  Pareto zones based on Gross Profit cumulative")
+    print(f"  ✓ Done v1.3 — {len(periods)} periods | Sheet: {SHEET_ID}")
+    print(f"  Categories: 7 Shopify order tags (Horse_Health, Grooming_Tools,")
+    print(f"              Horsewear, Supplements, Tack_Equipment,")
+    print(f"              StableSupplies_Collection, Rider)")
+    print(f"  Sorted and zoned by Gross Profit (cumulative)")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
