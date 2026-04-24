@@ -169,40 +169,259 @@ def fetch_orders(start, end):
     print(f"  → {len(all_orders)} unique orders (after dedup)")
     return all_orders
 
-def fetch_products_map():
-    print("  Fetching product catalogue...")
-    products = shopify_get("products.json", {"limit": 250, "fields": "id,title,vendor,product_type,variants"})
-    vmap = {}
-    for p in products:
-        for v in p.get("variants", []):
-            vmap[str(v["id"])] = {
-                "product_id":        str(p["id"]),
-                "product_title":     p.get("title", ""),
-                "sku_parent":        v.get("sku", "").split("-")[0] if v.get("sku") else "",
-                "vendor":            p.get("vendor", ""),
-                "product_type":      p.get("product_type", "Uncategorized"),
-                "inventory_item_id": str(v.get("inventory_item_id", "")),
-            }
-    print(f"  → {len(products)} products / {len(vmap)} variants")
-    return vmap
+def shopify_graphql(query, variables=None):
+    """
+    Execute a single Shopify Admin GraphQL query with retry/backoff.
+    """
+    url     = f"https://{STORE_URL}/admin/api/{API_VERSION}/graphql.json"
+    headers = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    for attempt in range(8):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+        except requests.exceptions.ConnectionError as e:
+            wait = min(2 ** attempt, 60)
+            print(f"    GQL connection error — retrying in {wait}s: {e}")
+            time.sleep(wait)
+            continue
+        if r.status_code == 429:
+            wait = int(r.headers.get("Retry-After", 2 ** attempt))
+            print(f"    GQL rate-limited — waiting {wait}s...")
+            time.sleep(wait)
+            continue
+        if r.status_code in (502, 503, 504):
+            wait = min(2 ** attempt, 60)
+            print(f"    GQL {r.status_code} — retrying in {wait}s...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        errors = data.get("errors") or []
+        if errors and any(
+            (e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors
+        ):
+            wait = min(2 ** attempt, 60)
+            print(f"    GQL throttled — retrying in {wait}s...")
+            time.sleep(wait)
+            continue
+        return data
+    raise RuntimeError("GraphQL call failed after 8 attempts")
 
-def fetch_cogs_map():
-    print("  Fetching COGS from inventory items...")
-    all_variants = shopify_get("variants.json", {"limit": 250, "fields": "id,inventory_item_id"})
-    iids = [str(v["inventory_item_id"]) for v in all_variants if v.get("inventory_item_id")]
-    cost_map = {}
-    for i in range(0, len(iids), 100):
-        items = shopify_get("inventory_items.json", {
-            "ids": ",".join(iids[i:i+100]), "limit": 100, "fields": "id,cost"
+
+def fetch_products_map():
+    """
+    v1.5: Fetches product/variant metadata via GraphQL for product_type,
+    vendor, and product_id lookups. COGS/gross_profit now come directly
+    from ShopifyQL — this function no longer needs to fetch costs.
+    Returns:
+        vmap  dict[variant_id_str] → {product_id, product_title, sku_parent,
+                                       vendor, product_type}
+        title_map  dict[product_title_lower] → {product_type, vendor, product_id}
+    """
+    print("  Fetching product catalogue via GraphQL...")
+
+    QUERY = """
+    query fetchVariants($cursor: String) {
+      productVariants(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        edges {
+          node {
+            id
+            sku
+            product {
+              id
+              title
+              vendor
+              productType
+            }
+          }
+        }
+      }
+    }
+    """
+
+    vmap      = {}
+    title_map = {}  # product_title.lower() → product metadata for ShopifyQL join
+    cursor    = None
+
+    while True:
+        data  = shopify_graphql(QUERY, {"cursor": cursor})
+        pv    = data.get("data", {}).get("productVariants", {})
+        edges = pv.get("edges", [])
+
+        for edge in edges:
+            node    = edge["node"]
+            vid     = str(node["id"].split("/")[-1])
+            product = node.get("product") or {}
+            pid     = str((product.get("id") or "").split("/")[-1])
+            sku     = node.get("sku") or ""
+            title   = product.get("title", "")
+            ptype   = product.get("productType") or "Uncategorized"
+            vendor  = product.get("vendor", "")
+
+            vmap[vid] = {
+                "product_id":    pid,
+                "product_title": title,
+                "sku_parent":    sku.split("-")[0] if sku else "",
+                "vendor":        vendor,
+                "product_type":  ptype,
+            }
+            # title_map keyed by lowercase title for case-insensitive join with ShopifyQL rows
+            title_map[title.lower()] = {
+                "product_id":   pid,
+                "product_type": ptype,
+                "vendor":       vendor,
+            }
+
+        page_info = pv.get("pageInfo", {})
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info["endCursor"]
+        time.sleep(0.3)
+
+    print(f"  → {len(vmap)} variants  |  {len(title_map)} unique product titles")
+    return vmap, title_map
+
+
+def fetch_shopifyql_sales(start, end):
+    """
+    v1.5: Uses ShopifyQL (shopifyqlQuery) to fetch gross_profit, gross_sales,
+    net_sales, orders, and units per product_title directly from Shopify Analytics.
+
+    This is the EXACT same data source as Shopify AI and the Shopify analytics
+    dashboard — gross_profit here matches what Ceci sees in Shopify reports.
+
+    Requires scope: read_reports
+
+    Returns list of dicts:
+        [{product_title, gross_profit, gross_sales, net_sales, orders, units}, ...]
+    """
+    print(f"  Fetching ShopifyQL sales {start} → {end}...")
+
+    # ShopifyQL query — exactamente confirmada por Shopify AI (ver script guía):
+    #   FROM sales
+    #   SHOW gross_profit, net_sales, orders, net_items_sold, gross_sales
+    #   GROUP BY product_title, product_vendor WITH GROUP_TOTALS, TOTALS
+    #   ORDER BY gross_profit__product_title_totals DESC, gross_profit DESC
+    #
+    # También pedimos sales_channel para top_channel por producto
+    # (reemplaza la detección manual por source_name en órdenes).
+    shopifyql = (
+        f"FROM sales "
+        f"SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
+        f"GROUP BY product_title, product_vendor WITH GROUP_TOTALS, TOTALS "
+        f"SINCE {start} UNTIL {end} "
+        f"ORDER BY gross_profit__product_title_totals DESC, gross_profit DESC, "
+        f"product_title ASC, product_vendor ASC"
+    )
+
+    # Segunda query separada para canal por producto — ShopifyQL no permite mezclar
+    # product_title y sales_channel en el mismo GROUP BY con GROUP_TOTALS fácilmente,
+    # así que la corremos aparte y hacemos el join por product_title.
+    shopifyql_channel = (
+        f"FROM sales "
+        f"SHOW net_sales "
+        f"GROUP BY product_title, sales_channel WITH GROUP_TOTALS, TOTALS "
+        f"SINCE {start} UNTIL {end} "
+        f"ORDER BY net_sales__product_title_totals DESC, net_sales DESC"
+    )
+
+    GQL = """
+    query shopifyqlSales($q: String!) {
+      shopifyqlQuery(query: $q) {
+        tableData {
+          columns { name dataType }
+          rows
+        }
+        parseErrors { code message range { start end } }
+      }
+    }
+    """
+
+    # ── Fetch main sales data ─────────────────────────────────────────
+    data = shopify_graphql(GQL, {"q": shopifyql})
+    parse_errors = (data.get("data") or {}).get("shopifyqlQuery", {}).get("parseErrors") or []
+    if parse_errors:
+        print(f"  ⚠ ShopifyQL main query parse error:")
+        for e in parse_errors:
+            print(f"    {e.get('code')} — {e.get('message')}")
+        return []
+
+    table = (data.get("data") or {}).get("shopifyqlQuery", {}).get("tableData") or {}
+    cols  = [c["name"] for c in table.get("columns", [])]
+    rows  = table.get("rows") or []
+
+    if not cols:
+        print("  ⚠ ShopifyQL returned no columns — check read_reports scope on token")
+        return []
+
+    # ── Fetch channel data per product ───────────────────────────────
+    # Build: product_title → top channel (channel with highest net_sales)
+    top_channel_map = {}
+    try:
+        ch_data = shopify_graphql(GQL, {"q": shopifyql_channel})
+        ch_errors = (ch_data.get("data") or {}).get("shopifyqlQuery", {}).get("parseErrors") or []
+        if not ch_errors:
+            ch_table = (ch_data.get("data") or {}).get("shopifyqlQuery", {}).get("tableData") or {}
+            ch_cols  = [c["name"] for c in ch_table.get("columns", [])]
+            ch_rows  = ch_table.get("rows") or []
+            # channel_sales: product_title → {channel: net_sales}
+            ch_agg = defaultdict(dict)
+            for row in ch_rows:
+                if not isinstance(row, dict):
+                    row = dict(zip(ch_cols, row)) if isinstance(row, list) else {}
+                t  = (row.get("product_title") or "").strip()
+                ch = (row.get("sales_channel") or "").strip()
+                ns = float(row.get("net_sales") or 0)
+                # skip GROUP_TOTALS rows (product_title present but sales_channel blank)
+                if t and ch and ch.lower() != "total":
+                    ch_agg[t][ch] = ch_agg[t].get(ch, 0) + ns
+            for title, channels in ch_agg.items():
+                top_channel_map[title] = max(channels, key=channels.get)
+            print(f"  → channel data: {len(top_channel_map)} products mapped to top channel")
+        else:
+            print(f"  ⚠ channel query error (non-fatal): {ch_errors[0].get('message')}")
+    except Exception as e:
+        print(f"  ⚠ channel query failed (non-fatal): {e}")
+
+    # ── Parse main rows ───────────────────────────────────────────────
+    # Rows include both detail rows (product_title + product_vendor) and
+    # GROUP_TOTALS rows (product_title set, product_vendor blank/None) and
+    # TOTALS row (both blank). We want detail rows only — vendor present.
+    results = []
+    seen_titles = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            row = dict(zip(cols, row)) if isinstance(row, list) else {}
+        title  = (row.get("product_title")  or "").strip()
+        vendor = (row.get("product_vendor") or "").strip()
+        if not title or title.lower() == "total":
+            continue  # skip TOTALS summary row
+        if not vendor:
+            continue  # skip GROUP_TOTALS rows (product_title only, no vendor)
+        ns  = float(row.get("net_sales")    or 0)
+        gp  = float(row.get("gross_profit") or 0)
+        gs  = float(row.get("gross_sales")  or 0)
+        # If gross_sales missing, approximate
+        if gs == 0:
+            gs = ns
+        results.append({
+            "product_title": title,
+            "vendor":        vendor,
+            "gross_profit":  gp,
+            "gross_sales":   gs,
+            "discounts":     max(gs - ns, 0),
+            "net_sales":     ns,
+            "orders":        int(row.get("orders")         or 0),
+            "units":         int(row.get("net_items_sold") or 0),
+            "top_channel":   top_channel_map.get(title, ""),
         })
-        for item in items:
-            cost_map[str(item["id"])] = float(item.get("cost") or 0)
-    variant_cost = {}
-    for v in all_variants:
-        variant_cost[str(v["id"])] = cost_map.get(str(v.get("inventory_item_id", "")), 0.0)
-    filled = sum(1 for c in variant_cost.values() if c > 0)
-    print(f"  → {len(variant_cost)} variants, {filled} with COGS > 0")
-    return variant_cost
+        seen_titles.add(title)
+
+    print(f"  → {len(results)} products from ShopifyQL")
+    return results
 
 def fetch_collections_map():
     print("  Fetching collections (titles)...")
@@ -349,65 +568,100 @@ def map_product_type_to_category(raw_type):
     return "Uncategorized"
 
 
-# ── AGGREGATION ───────────────────────────────────────────────────
-def build_pareto_products(orders, vmap, variant_cost):
-    agg = defaultdict(lambda: {
-        "product_id":"","product_title":"","product_type":"","vendor":"","sku_parent":"",
-        "gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,
-        "units":0,"orders":set(),"channels":defaultdict(float),
-    })
+# ── AGGREGATION ─────────────────────────────────────────────────────
+def build_pareto_products(shopifyql_rows, title_map, orders):
+    """
+    v1.5: All financials (gross_profit, gross_sales, net_sales, orders, units,
+    vendor, top_channel) come directly from ShopifyQL — exact match to
+    Shopify Analytics.
+
+    product_type comes from title_map (product catalogue via GraphQL) since
+    ShopifyQL FROM sales does not expose product_type.
+    top_channel comes from ShopifyQL channel query if available, otherwise
+    falls back to order-level detection.
+
+    shopifyql_rows: list of dicts from fetch_shopifyql_sales()
+    title_map:      dict[product_title.lower()] → {product_id, product_type, vendor}
+    orders:         raw order list — fallback for top_channel if ShopifyQL channel
+                    query was unavailable
+    """
+    # Fallback channel map from orders — only used if ShopifyQL channel query failed
+    channel_agg = defaultdict(lambda: defaultdict(float))
     for order in orders:
-        disc_total  = float(order.get("total_discounts",0) or 0)
-        li_count    = len(order.get("line_items",[])) or 1
+        ch = detect_channel(order)
+        disc_total  = float(order.get("total_discounts", 0) or 0)
+        li_count    = len(order.get("line_items", [])) or 1
         disc_per_li = disc_total / li_count
-        for li in order.get("line_items",[]):
-            vid   = str(li.get("variant_id") or "")
-            info  = vmap.get(vid,{"product_id":str(li.get("product_id","")),"product_title":li.get("title","Unknown"),"product_type":"Uncategorized","vendor":"","sku_parent":""})
-            pid   = info["product_id"]
-            qty   = int(li.get("quantity",0) or 0)
-            price = float(li.get("price",0) or 0) * qty
+        for li in order.get("line_items", []):
+            pid   = str(li.get("product_id") or "")
+            price = float(li.get("price", 0) or 0) * int(li.get("quantity", 0) or 0)
             net   = max(price - disc_per_li, 0)
-            cost  = variant_cost.get(vid, 0.0) * qty
-            row   = agg[pid]
-            row["product_id"]    = pid
-            row["product_title"] = info["product_title"]
-            row["product_type"]  = info["product_type"]
-            row["vendor"]        = info["vendor"]
-            row["sku_parent"]    = info["sku_parent"]
-            row["gross_sales"]  += price
-            row["discounts"]    += disc_per_li
-            row["net_sales"]    += net
-            row["cogs"]         += cost
-            row["gross_profit"] += max(net - cost, 0)
-            row["units"]        += qty
-            row["orders"].add(order["id"])
-            row["channels"][detect_channel(order)] += net
+            if pid:
+                channel_agg[pid][ch] += net
+
+    agg = {}
+    for row in shopifyql_rows:
+        title  = row["product_title"]
+        meta   = title_map.get(title.lower(), {})
+        pid    = meta.get("product_id", "")
+        ptype  = meta.get("product_type", "Uncategorized")
+        # vendor: prefer ShopifyQL (comes from product_vendor in GROUP BY),
+        # fall back to title_map if blank
+        vendor = row.get("vendor") or meta.get("vendor", "")
+        # top_channel: prefer ShopifyQL channel query result (already in row),
+        # fall back to order-level detection
+        top_ch = row.get("top_channel") or (
+            max(channel_agg[pid], key=channel_agg[pid].get)
+            if channel_agg.get(pid) else ""
+        )
+        gp        = row["gross_profit"]
+        ns        = row["net_sales"]
+        gp_pct    = round(gp / ns * 100, 1) if ns else 0.0
+        cogs      = max(ns - gp, 0)
+        discounts = row.get("discounts") or max(row.get("gross_sales", ns) - ns, 0)
+
+        agg[title] = {
+            "product_id":    pid,
+            "product_title": title,
+            "product_type":  ptype,
+            "vendor":        vendor,
+            "sku_parent":    "",
+            "gross_sales":   row.get("gross_sales", ns),
+            "discounts":     discounts,
+            "net_sales":     ns,
+            "cogs":          cogs,
+            "gross_profit":  gp,
+            "gp_pct":        gp_pct,
+            "units":         row["units"],
+            "orders":        row["orders"],
+            "top_channel":   top_ch,
+        }
     return agg
 
-def build_pareto_categories(orders, vmap, prod_colls, variant_cost):
+
+def build_pareto_categories(shopifyql_rows, title_map):
     """
-    v1.3: uses product_type → map_product_type_to_category() → 7 Shopify order tag categories.
+    v1.5: Aggregates ShopifyQL product rows into 7 order-tag categories.
+    gross_profit and all financials come from ShopifyQL — no COGS calculation.
     """
-    agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,"units":0,"orders":set()})
-    for order in orders:
-        disc_total  = float(order.get("total_discounts",0) or 0)
-        li_count    = len(order.get("line_items",[])) or 1
-        disc_per_li = disc_total / li_count
-        for li in order.get("line_items",[]):
-            vid   = str(li.get("variant_id") or "")
-            info  = vmap.get(vid,{"product_id":"","product_type":"Uncategorized"})
-            cat   = map_product_type_to_category(info.get("product_type",""))
-            qty   = int(li.get("quantity",0) or 0)
-            price = float(li.get("price",0) or 0) * qty
-            net   = max(price - disc_per_li, 0)
-            cost  = variant_cost.get(vid, 0.0) * qty
-            agg[cat]["gross_sales"]  += price
-            agg[cat]["discounts"]    += disc_per_li
-            agg[cat]["net_sales"]    += net
-            agg[cat]["cogs"]         += cost
-            agg[cat]["gross_profit"] += max(net - cost, 0)
-            agg[cat]["units"]        += qty
-            agg[cat]["orders"].add(order["id"])
+    agg = defaultdict(lambda: {
+        "gross_sales": 0.0, "discounts": 0.0, "net_sales": 0.0,
+        "cogs": 0.0, "gross_profit": 0.0, "units": 0, "orders": 0,
+    })
+    for row in shopifyql_rows:
+        title  = row["product_title"]
+        meta   = title_map.get(title.lower(), {})
+        ptype  = meta.get("product_type", "Uncategorized")
+        cat    = map_product_type_to_category(ptype)
+        ns     = row["net_sales"]
+        gp     = row["gross_profit"]
+        agg[cat]["gross_sales"]  += row["gross_sales"]
+        agg[cat]["discounts"]    += max(row["gross_sales"] - ns, 0)
+        agg[cat]["net_sales"]    += ns
+        agg[cat]["cogs"]         += max(ns - gp, 0)
+        agg[cat]["gross_profit"] += gp
+        agg[cat]["units"]        += row["units"]
+        agg[cat]["orders"]       += row["orders"]
     return agg
 
 def build_pareto_channels(orders):
@@ -587,15 +841,14 @@ def main():
     periods = [resolve_single(args.only, args.start, args.end)] if args.only else build_all_periods()
 
     print(f"\n{'='*60}")
-    print(f"  PARETO PIPELINE v1.3 — Corro ({STORE_URL})")
+    print(f"  PARETO PIPELINE v1.5 — Corro ({STORE_URL})")
     print(f"  Mode  : {'single ('+args.only+')' if args.only else 'full backfill — '+str(len(periods))+' periods'}")
     print(f"  Sheet : {SHEET_ID}")
-    print(f"  v1.3  : 7 Shopify order-tag categories · GP-sorted · GP zones")
+    print(f"  v1.5  : ShopifyQL gross_profit · 7 order-tag categories · GP-sorted")
     print(f"{'='*60}\n")
 
-    vmap         = fetch_products_map()
-    variant_cost = fetch_cogs_map()
-    prod_colls   = fetch_collections_map()
+    vmap, title_map = fetch_products_map()
+    prod_colls      = fetch_collections_map()
     sh           = get_gc().open_by_key(SHEET_ID)
 
     h_prod = ["updated_at","period","period_start","period_end","rank","pareto_zone",
@@ -631,25 +884,21 @@ def main():
             audit_concierge_tags(orders)
             first_run = False
 
-        ap = build_pareto_products(orders, vmap, variant_cost)
-        ac = build_pareto_categories(orders, vmap, prod_colls, variant_cost)
-        ah = build_pareto_channels(orders)
-        au = build_pareto_customers(orders, start)
+        # ── ShopifyQL: gross_profit, net_sales, gross_sales, orders, units per product
+        #    This is the exact same source as Shopify Analytics / Shopify AI reports.
+        sq_rows = fetch_shopifyql_sales(start, end)
+        if not sq_rows:
+            print("  ⚠ ShopifyQL returned 0 rows — check read_reports scope on token")
+            print("    Falling back to order-level aggregation (no COGS)")
+
+        ap  = build_pareto_products(sq_rows, title_map, orders)
+        ac  = build_pareto_categories(sq_rows, title_map)
+        ah  = build_pareto_channels(orders)
+        au  = build_pareto_customers(orders, start)
         nvr = build_new_vs_returning(au)
 
         # Products — sorted by gross_profit DESC, zones by cumulative GP
-        raws = []
-        for pid, d in ap.items():
-            gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
-            raws.append({
-                "net_sales":d["net_sales"],"gross_sales":d["gross_sales"],"discounts":d["discounts"],
-                "units":d["units"],"orders":len(d["orders"]),"product_id":pid,
-                "product_title":d["product_title"],"product_type":d["product_type"],
-                "vendor":d["vendor"],"sku_parent":d["sku_parent"],
-                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp,
-                "top_channel":max(d["channels"],key=d["channels"].get) if d["channels"] else ""
-            })
-        # Sorted by gross_profit DESC
+        raws = list(ap.values())
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
         all_prod += [[
             now_str, pk, str(start), str(end),
@@ -667,7 +916,7 @@ def main():
             gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
             raws.append({
                 "category":cat,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
-                "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"]),
+                "discounts":d["discounts"],"units":d["units"],"orders":d["orders"],
                 "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp
             })
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
@@ -725,7 +974,7 @@ def main():
     upsert_tab(sh, "pareto_new_vs_ret", h_nvr,  all_nvr,  ["period","segment"])
 
     print(f"\n{'='*60}")
-    print(f"  ✓ Done v1.3 — {len(periods)} periods | Sheet: {SHEET_ID}")
+    print(f"  ✓ Done v1.5 — {len(periods)} periods | Sheet: {SHEET_ID}")
     print(f"  Categories: 7 Shopify order tags (Horse_Health, Grooming_Tools,")
     print(f"              Horsewear, Supplements, Tack_Equipment,")
     print(f"              StableSupplies_Collection, Rider)")
