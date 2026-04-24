@@ -310,19 +310,25 @@ function gpClr(gp){const n=parseFloat(gp)||0;return n<0?"var(--C)":n<20?"var(--B
 // ── CATEGORY GROUPING — maps Shopify product_type to 5 main categories ──
 // Source: Shopify AI / product_type export confirmed April 2026 (3,021 products)
 // Categories intentionally in English to match dashboard language.
-const CAT_KEYWORDS = {
-  "Tack & Equipment":             ["bridle","rein","bridle accessories","saddle pad","all purpose","hunter/jumper","dressage saddle","half pad","stirrup","dressage bridle","belt"],
-  "Rider Apparel & Accessories":  ["apparel","breeches","accessories","hat","shirt","schooling","leather handbag","handbag"],
-  "Horse Care":                   ["detangler","body brace","hoof care","poultice","liniment","relief spray","shampoo","fungal","skin & hair","supplement","personal care"],
-  "Dogs":                         ["dog"],
-  "Stable & Other":               ["stall mat","stall & trailer","trailer cleaning","cavali club","spring 2024","special edition","_elite_gift","elite_gift"],
-};
+// NOTE: Dogs must be FIRST — "Dog > Supplements" contains "supplement" (Horse Care keyword)
+//       and "Dog > Treats & Accessories" contains "accessories" (Rider keyword).
+//       Checking Dogs first avoids those false matches.
+const CAT_KEYWORDS_ORDER = [
+  ["Dogs",                        ["dog"]],
+  ["Tack & Equipment",            ["bridle","rein","bridle accessories","saddle pad","all purpose","hunter/jumper","dressage saddle","half pad","stirrup","dressage bridle","belt"]],
+  ["Rider Apparel & Accessories", ["apparel","breeches","accessories","hat","shirt","schooling","leather handbag","handbag"]],
+  ["Horse Care",                  ["detangler","body brace","hoof care","poultice","liniment","relief spray","shampoo","fungal","skin & hair","supplement","personal care"]],
+  ["Stable & Other",              ["stall mat","stall & trailer","trailer cleaning","cavali club","spring 2024","special edition","_elite_gift","elite_gift"]],
+];
+// Also keep as object for color lookups
+const CAT_KEYWORDS = Object.fromEntries(CAT_KEYWORDS_ORDER);
 
 function getMainCategory(raw) {
-  // v1.2: raw is now product_type from Shopify, not a collection path
+  // v1.2: raw is product_type from Shopify. Uses ordered array to avoid false matches
+  // (Dogs checked first so "Dog > Supplements" doesn't fall into Horse Care).
   if (!raw) return "Uncategorized";
   const low = raw.trim().toLowerCase();
-  for (const [cat, kws] of Object.entries(CAT_KEYWORDS)) {
+  for (const [cat, kws] of CAT_KEYWORDS_ORDER) {
     if (kws.some(k => low.includes(k))) return cat;
   }
   return "Uncategorized";
@@ -368,7 +374,18 @@ async function fetchTab(tab){
   }catch(e){console.error(tab,e);return[];}
 }
 
-function byPeriod(rows,pk){return rows.filter(r=>(r.period||"").trim()===pk).sort((a,b)=>parseInt(a.rank)-parseInt(b.rank))}
+// Sort by gross_profit DESC (rank in Sheet may be stale from a previous net_sales run)
+function byPeriod(rows,pk){
+  return rows
+    .filter(r=>(r.period||"").trim()===pk)
+    .sort((a,b)=>parseFloat(b.gross_profit||0)-parseFloat(a.gross_profit||0));
+}
+function byPeriodNS(rows,pk){
+  // Channels and Customers still rank by net_sales (no GP field available)
+  return rows
+    .filter(r=>(r.period||"").trim()===pk)
+    .sort((a,b)=>parseFloat(b.net_sales||0)-parseFloat(a.net_sales||0));
+}
 
 // ── SUMMARY KPIs ──────────────────────────────────────────────────
 function renderSummary(fp){
@@ -442,16 +459,18 @@ function renderProducts(rows){
     <th class="r">% NS</th>
     <th class="r">Cum. NS</th>
     <th class="r">Units</th><th class="r">Orders</th><th>Top Channel</th>
-  </tr></thead><tbody>${show.map(r=>{
+  </tr></thead><tbody>${show.map((r,i)=>{
     cumNS += parseFloat(r.net_sales||0);
     cumGP += parseFloat(r.gross_profit||0);
     const pctNS    = totalNS>0 ? ((parseFloat(r.net_sales||0)/totalNS)*100).toFixed(1) : "0.0";
     const cumNSpct = totalNS>0 ? ((cumNS/totalNS)*100).toFixed(1) : "0.0";
     const cumGPpct = totalGP>0 ? ((cumGP/totalGP)*100).toFixed(1) : "0.0";
+    // Assign pareto zone dynamically based on re-sorted cumulative GP
+    const dynZone  = parseFloat(cumGPpct)<=80 ? "A" : parseFloat(cumGPpct)<=95 ? "B" : "C";
     return `<tr>
-      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
-      <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
-      <td class="name">${r.product_title||"—"}<small>${r.product_type||""}</small></td>
+      <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${i+1}</td>
+      <td><span class="zone ${zCls(dynZone)}">${dynZone}</span></td>
+      <td class="name">${r.product_title||"—"}<small>${getMainCategory(r.product_type||"")}</small></td>
       <td class="r gp-sep" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
       <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
       <td class="r"><span class="cum-badge cum-gp">${cumGPpct}%</span></td>
@@ -464,6 +483,32 @@ function renderProducts(rows){
     </tr>`;
   }).join("")}</tbody></table>
   ${rows.length>50?`<div style="padding:9px 14px;font-size:10px;color:var(--tx3)">Showing top 50 of ${rows.length} products. Full list in Google Sheets.</div>`:""}`;
+}
+
+// ── BUILD CATEGORIES FROM ALL PRODUCTS (product_type field) ──────
+// v1.2: replaces pareto_categories sheet which had stale collection-path data.
+// Aggregates every product row in the period using getMainCategory(product_type).
+function buildCatsFromProducts(productRows) {
+  const groups = {};
+  productRows.forEach(r => {
+    const cat = getMainCategory(r.product_type || "");
+    if (!groups[cat]) groups[cat] = {
+      category: cat, gross_sales: 0, net_sales: 0, gross_profit: 0,
+      cogs: 0, units: 0, orders: 0
+    };
+    const g = groups[cat];
+    g.gross_sales  += parseFloat(r.gross_sales||0);
+    g.net_sales    += parseFloat(r.net_sales||0);
+    g.gross_profit += parseFloat(r.gross_profit||0);
+    g.cogs         += parseFloat(r.cogs||0);
+    g.units        += parseInt(r.units||0);
+    g.orders       += parseInt(r.orders||0);
+  });
+  Object.values(groups).forEach(g => {
+    g.gp_pct = g.net_sales > 0 ? ((g.gross_profit / g.net_sales) * 100).toFixed(1) : "0.0";
+  });
+  // Sort by Gross Profit DESC
+  return Object.values(groups).sort((a,b) => b.gross_profit - a.gross_profit);
 }
 
 // ── CATEGORY GROUPING + CHART + TABLE ────────────────────────────
@@ -565,8 +610,8 @@ function renderCategoryChart(grouped) {
   });
 }
 
-function renderCategories(rawRows) {
-  const grouped = groupByMainCategory(rawRows);
+function renderCategories(grouped) {
+  // v1.2: receives already-grouped array from buildCatsFromProducts() — no re-grouping needed
 
   // Render chart
   renderCategoryChart(grouped);
@@ -724,8 +769,13 @@ async function render(){
   ]);
 
   const fp=byPeriod(products,pk), fc=byPeriod(categories,pk);
-  const fh=byPeriod(channels,pk), fcu=byPeriod(customers,pk);
+  const fh=byPeriodNS(channels,pk), fcu=byPeriodNS(customers,pk);
   const fnvr=byPeriod(nvr,pk);
+
+  // v1.2: Rebuild categories directly from product_type field of ALL products in this period.
+  // This ensures ALL products are counted (not just the ~7 that old collection sheet had).
+  // pareto_categories sheet may be stale — product-level data is always fresh.
+  const fcFromProducts = buildCatsFromProducts(fp);
 
   if(fp[0]?.period_start)
     $("period-info").textContent=`${label} · ${fp[0].period_start} → ${fp[0].period_end}`;
@@ -734,7 +784,7 @@ async function render(){
   renderCumBar(fp);
   renderInsight(fp,fh,label);
   renderProducts(fp);
-  renderCategories(fc);
+  renderCategories(fcFromProducts);
   renderChannels(fh);
   renderNVR(fnvr);
   renderCustomers(fcu, fp);
