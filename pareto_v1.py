@@ -288,45 +288,18 @@ def fetch_products_map():
 def fetch_shopifyql_sales(start, end):
     """
     v1.5: Uses ShopifyQL (shopifyqlQuery) to fetch gross_profit, gross_sales,
-    net_sales, orders, and units per product_title directly from Shopify Analytics.
+    net_sales, orders, net_items_sold per product_title from Shopify Analytics.
 
-    This is the EXACT same data source as Shopify AI and the Shopify analytics
-    dashboard — gross_profit here matches what Ceci sees in Shopify reports.
-
+    Query matches exactly the confirmed Shopify AI script.
     Requires scope: read_reports
 
-    Returns list of dicts:
-        [{product_title, gross_profit, gross_sales, net_sales, orders, units}, ...]
+    Two separate queries:
+      1. Main: product financials grouped by product_title + product_vendor
+      2. Channel: top sales_channel per product_title (non-fatal if fails)
+
+    Returns list of dicts per product title.
     """
     print(f"  Fetching ShopifyQL sales {start} → {end}...")
-
-    # ShopifyQL query — exactamente confirmada por Shopify AI (ver script guía):
-    #   FROM sales
-    #   SHOW gross_profit, net_sales, orders, net_items_sold, gross_sales
-    #   GROUP BY product_title, product_vendor WITH GROUP_TOTALS, TOTALS
-    #   ORDER BY gross_profit__product_title_totals DESC, gross_profit DESC
-    #
-    # También pedimos sales_channel para top_channel por producto
-    # (reemplaza la detección manual por source_name en órdenes).
-    shopifyql = (
-        f"FROM sales "
-        f"SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
-        f"GROUP BY product_title, product_vendor WITH GROUP_TOTALS, TOTALS "
-        f"SINCE {start} UNTIL {end} "
-        f"ORDER BY gross_profit__product_title_totals DESC, gross_profit DESC, "
-        f"product_title ASC, product_vendor ASC"
-    )
-
-    # Segunda query separada para canal por producto — ShopifyQL no permite mezclar
-    # product_title y sales_channel en el mismo GROUP BY con GROUP_TOTALS fácilmente,
-    # así que la corremos aparte y hacemos el join por product_title.
-    shopifyql_channel = (
-        f"FROM sales "
-        f"SHOW net_sales "
-        f"GROUP BY product_title, sales_channel WITH GROUP_TOTALS, TOTALS "
-        f"SINCE {start} UNTIL {end} "
-        f"ORDER BY net_sales__product_title_totals DESC, net_sales DESC"
-    )
 
     GQL = """
     query shopifyqlSales($q: String!) {
@@ -340,34 +313,61 @@ def fetch_shopifyql_sales(start, end):
     }
     """
 
-    # ── Fetch main sales data ─────────────────────────────────────────
-    data = shopify_graphql(GQL, {"q": shopifyql})
-    parse_errors = (data.get("data") or {}).get("shopifyqlQuery", {}).get("parseErrors") or []
-    if parse_errors:
-        print(f"  ⚠ ShopifyQL main query parse error:")
-        for e in parse_errors:
-            print(f"    {e.get('code')} — {e.get('message')}")
-        return []
+    def run_shopifyql(q):
+        """Run a ShopifyQL query, return (cols, rows, errors)."""
+        d      = shopify_graphql(GQL, {"q": q})
+        errs   = (d.get("data") or {}).get("shopifyqlQuery", {}).get("parseErrors") or []
+        table  = (d.get("data") or {}).get("shopifyqlQuery", {}).get("tableData") or {}
+        cols   = [c["name"] for c in table.get("columns", [])]
+        rows   = table.get("rows") or []
+        return cols, rows, errs
 
-    table = (data.get("data") or {}).get("shopifyqlQuery", {}).get("tableData") or {}
-    cols  = [c["name"] for c in table.get("columns", [])]
-    rows  = table.get("rows") or []
+    # ── Query 1: product financials ───────────────────────────────────
+    # GROUP BY product_title, product_vendor (no GROUP_TOTALS — simpler, no parse errors)
+    # ORDER BY gross_profit DESC — straightforward, matches Shopify AI guidance
+    q_main = (
+        f"FROM sales "
+        f"SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
+        f"GROUP BY product_title, product_vendor "
+        f"SINCE {start} UNTIL {end} "
+        f"ORDER BY gross_profit DESC"
+    )
+    cols, rows, errs = run_shopifyql(q_main)
+
+    if errs:
+        # Fallback: drop product_vendor, group by product_title only
+        print(f"  ⚠ ShopifyQL main query error — retrying without product_vendor:")
+        for e in errs:
+            print(f"    {e.get('code')} — {e.get('message')}")
+        q_fallback = (
+            f"FROM sales "
+            f"SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
+            f"GROUP BY product_title "
+            f"SINCE {start} UNTIL {end} "
+            f"ORDER BY gross_profit DESC"
+        )
+        cols, rows, errs2 = run_shopifyql(q_fallback)
+        if errs2:
+            for e in errs2:
+                print(f"  ✗ ShopifyQL fallback failed: {e.get('code')} — {e.get('message')}")
+            return []
 
     if not cols:
         print("  ⚠ ShopifyQL returned no columns — check read_reports scope on token")
         return []
 
-    # ── Fetch channel data per product ───────────────────────────────
-    # Build: product_title → top channel (channel with highest net_sales)
+    # ── Query 2: top channel per product (non-fatal) ──────────────────
     top_channel_map = {}
     try:
-        ch_data = shopify_graphql(GQL, {"q": shopifyql_channel})
-        ch_errors = (ch_data.get("data") or {}).get("shopifyqlQuery", {}).get("parseErrors") or []
-        if not ch_errors:
-            ch_table = (ch_data.get("data") or {}).get("shopifyqlQuery", {}).get("tableData") or {}
-            ch_cols  = [c["name"] for c in ch_table.get("columns", [])]
-            ch_rows  = ch_table.get("rows") or []
-            # channel_sales: product_title → {channel: net_sales}
+        q_ch = (
+            f"FROM sales "
+            f"SHOW net_sales "
+            f"GROUP BY product_title, sales_channel "
+            f"SINCE {start} UNTIL {end} "
+            f"ORDER BY net_sales DESC"
+        )
+        ch_cols, ch_rows, ch_errs = run_shopifyql(q_ch)
+        if not ch_errs and ch_cols:
             ch_agg = defaultdict(dict)
             for row in ch_rows:
                 if not isinstance(row, dict):
@@ -375,36 +375,43 @@ def fetch_shopifyql_sales(start, end):
                 t  = (row.get("product_title") or "").strip()
                 ch = (row.get("sales_channel") or "").strip()
                 ns = float(row.get("net_sales") or 0)
-                # skip GROUP_TOTALS rows (product_title present but sales_channel blank)
-                if t and ch and ch.lower() != "total":
+                if t and ch:
                     ch_agg[t][ch] = ch_agg[t].get(ch, 0) + ns
-            for title, channels in ch_agg.items():
-                top_channel_map[title] = max(channels, key=channels.get)
-            print(f"  → channel data: {len(top_channel_map)} products mapped to top channel")
+            for t, channels in ch_agg.items():
+                top_channel_map[t] = max(channels, key=channels.get)
+            print(f"  → channel query: {len(top_channel_map)} products mapped")
         else:
-            print(f"  ⚠ channel query error (non-fatal): {ch_errors[0].get('message')}")
+            if ch_errs:
+                print(f"  ⚠ channel query error (non-fatal): {ch_errs[0].get('message')}")
     except Exception as e:
         print(f"  ⚠ channel query failed (non-fatal): {e}")
 
-    # ── Parse main rows ───────────────────────────────────────────────
-    # Rows include both detail rows (product_title + product_vendor) and
-    # GROUP_TOTALS rows (product_title set, product_vendor blank/None) and
-    # TOTALS row (both blank). We want detail rows only — vendor present.
+    # ── Parse rows ────────────────────────────────────────────────────
     results = []
-    seen_titles = set()
+    seen    = set()
     for row in rows:
         if not isinstance(row, dict):
             row = dict(zip(cols, row)) if isinstance(row, list) else {}
         title  = (row.get("product_title")  or "").strip()
         vendor = (row.get("product_vendor") or "").strip()
-        if not title or title.lower() == "total":
-            continue  # skip TOTALS summary row
-        if not vendor:
-            continue  # skip GROUP_TOTALS rows (product_title only, no vendor)
-        ns  = float(row.get("net_sales")    or 0)
-        gp  = float(row.get("gross_profit") or 0)
-        gs  = float(row.get("gross_sales")  or 0)
-        # If gross_sales missing, approximate
+        if not title:
+            continue
+        # Deduplicate: if product_title appears multiple times (can happen when
+        # product has variants from multiple vendors), aggregate into one row
+        if title in seen:
+            for r in results:
+                if r["product_title"] == title:
+                    r["gross_profit"] += float(row.get("gross_profit") or 0)
+                    r["gross_sales"]  += float(row.get("gross_sales")  or 0)
+                    r["net_sales"]    += float(row.get("net_sales")    or 0)
+                    r["orders"]       += int(row.get("orders")         or 0)
+                    r["units"]        += int(row.get("net_items_sold") or 0)
+                    break
+            continue
+        seen.add(title)
+        ns = float(row.get("net_sales")    or 0)
+        gp = float(row.get("gross_profit") or 0)
+        gs = float(row.get("gross_sales")  or 0)
         if gs == 0:
             gs = ns
         results.append({
@@ -418,7 +425,6 @@ def fetch_shopifyql_sales(start, end):
             "units":         int(row.get("net_items_sold") or 0),
             "top_channel":   top_channel_map.get(title, ""),
         })
-        seen_titles.add(title)
 
     print(f"  → {len(results)} products from ShopifyQL")
     return results
@@ -884,12 +890,44 @@ def main():
             audit_concierge_tags(orders)
             first_run = False
 
-        # ── ShopifyQL: gross_profit, net_sales, gross_sales, orders, units per product
-        #    This is the exact same source as Shopify Analytics / Shopify AI reports.
+        # ── ShopifyQL: gross_profit, gross_sales, net_sales, orders, units per product
+        #    Same source as Shopify Analytics — gross_profit matches exactly.
         sq_rows = fetch_shopifyql_sales(start, end)
         if not sq_rows:
-            print("  ⚠ ShopifyQL returned 0 rows — check read_reports scope on token")
-            print("    Falling back to order-level aggregation (no COGS)")
+            print("  ⚠ ShopifyQL returned 0 rows — skipping products/categories for this period")
+            print("    Check that token has read_reports scope.")
+            # Skip products + categories but still write channels, customers, nvr
+            ah  = build_pareto_channels(orders)
+            au  = build_pareto_customers(orders, start)
+            nvr = build_new_vs_returning(au)
+            # channels
+            raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
+                     "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
+            rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+            all_ch += [[
+                now_str, pk, str(start), str(end),
+                r["rank"], r["pareto_zone"], r["channel"],
+                round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
+                r["pct_revenue"], r["cum_pct"], r["units"], r["orders"]
+            ] for r in rs]
+            # customers
+            raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
+            rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+            all_cust += [[
+                now_str, pk, str(start), str(end),
+                r["rank"], r["pareto_zone"],
+                r["customer_id"], r["name"], r["email"], r["segment"],
+                round(r["net_sales"],2), r["pct_revenue"], r["cum_pct"],
+                r["orders"], r["units"], r["first_order"], r["last_order"]
+            ] for r in rs]
+            tc = sum(v["count"] for v in nvr.values()) or 1
+            tr = sum(v["net_sales"] for v in nvr.values()) or 1
+            for seg, v in nvr.items():
+                all_nvr.append([now_str, pk, str(start), str(end), seg.capitalize(),
+                    v["count"], round(v["net_sales"],2), v["orders"],
+                    round(v["count"]/tc*100,1), round(v["net_sales"]/tr*100,1)])
+            print(f"  → {len(orders)} orders | channels/customers written | products SKIPPED (ShopifyQL empty)")
+            continue
 
         ap  = build_pareto_products(sq_rows, title_map, orders)
         ac  = build_pareto_categories(sq_rows, title_map)
