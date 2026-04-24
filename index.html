@@ -161,9 +161,9 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
     <div>
       <div class="brand-row">
         <div class="brand-dot"></div>
-        <div><div class="brand-name">Equestrian Labs — Corro</div><div class="brand-sub">Pareto Sales Analysis · Shopify → Sheets · Net Sales ranked · Gross Profit zones</div></div>
+        <div><div class="brand-name">Equestrian Labs — Corro</div><div class="brand-sub">Pareto Sales Analysis · Shopify → Sheets · Gross Profit ranked · Gross Profit zones</div></div>
       </div>
-      <h1>Pareto <span>Sales Analysis</span></h1>
+      <h1>Pareto <span>Sales Analysis / Gross Profit</span></h1>
       <div class="period-info" id="period-info">—</div>
     </div>
     <div class="controls">
@@ -199,7 +199,7 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
     <strong>Net Sales</strong> = Gross Sales − Discounts &nbsp;·&nbsp;
     <strong>Gross Profit</strong> = Net Sales − COGS (cost of goods) &nbsp;·&nbsp;
     <em style="color:var(--tx3)">Products ranked by Net Sales · Pareto zones (A/B/C) assigned by cumulative Gross Profit</em>
-    <br><span class="formula">Pareto 80/20: Zone A = top products that generate 80% of Gross Profit, sorted by Net Sales</span>
+    <br><span class="formula">Pareto 80/20: Zone A = top products that generate 80% of Gross Profit, sorted by Gross Profit</span>
   </div>
 
   <!-- KPI CARDS — removed duplicate Gross Sales, kept Net Sales as primary -->
@@ -209,7 +209,7 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
     <div class="card"><div class="card-l">Total Orders</div><div class="card-v" id="s-ord">—</div></div>
     <div class="card"><div class="card-l">Units Sold</div><div class="card-v" id="s-prod">—</div></div>
     <div class="card"><div class="card-l">Pareto 80/20</div><div class="card-v" id="s-za">—</div><div class="card-s" id="s-za-sub">products = 80% Gross Profit</div></div>
-    <div class="card"><div class="card-l">Top Seller</div><div class="card-v" id="s-top1">—</div><div class="card-s" id="s-top1-name">of Net Sales</div></div>
+    <div class="card"><div class="card-l">Top GP Seller</div><div class="card-v" id="s-top1">—</div><div class="card-s" id="s-top1-name">of Gross Profit</div></div>
     <div class="card"><div class="card-l">Updated</div><div class="card-v" style="font-size:13px;margin-top:2px" id="s-upd">—</div></div>
   </div>
 
@@ -233,7 +233,7 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
   </div>
 
   <!-- CATEGORIES — now with parent-category grouping + chart -->
-  <div class="sec"><div class="sn">02</div><div class="sl"></div><div class="st">Summary by Main Category — Rider · Horse Wear · Stable · Pharmacy · Other</div></div>
+  <div class="sec"><div class="sn">02</div><div class="sl"></div><div class="st">Revenue by Main Category — Tack & Equipment · Rider Apparel · Horse Care · Dogs · Stable & Other</div></div>
 
   <!-- CATEGORY CHART (Gross Sales + Gross Profit side by side) -->
   <div class="chart-wrap">
@@ -251,7 +251,7 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
   <div class="tbl-wrap" style="margin-top:8px">
     <div class="tbl-head">
       <div class="tbl-title">Revenue by Main Category</div>
-      <div class="tbl-note">Grouped: Rider · Horse Wear · Stable · Pharmacy · Other</div>
+      <div class="tbl-note">Grouped by Shopify product_type · Tack & Equipment · Rider Apparel · Horse Care · Dogs · Stable & Other</div>
     </div>
     <div id="tbl-categories"><div class="empty">Select a period above</div></div>
   </div>
@@ -259,6 +259,7 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
   <!-- CHANNELS -->
   <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">Summary by Sales Channel</div></div>
   <div id="ch-summary"><div class="empty">Loading...</div></div>
+  <div class="ch-grid" style="margin-top:8px" id="ch-grid"></div>
 
   <!-- NEW VS RETURNING -->
   <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">New vs Returning customers — revenue summary</div></div>
@@ -306,31 +307,25 @@ function zCls(z){return z==="A"?"zA":z==="B"?"zB":"zC"}
 function zClr(z){return z==="A"?"var(--bar-a)":z==="B"?"var(--bar-b)":"var(--bar-c)"}
 function gpClr(gp){const n=parseFloat(gp)||0;return n<0?"var(--C)":n<20?"var(--B)":"var(--A)"}
 
-// ── CATEGORY GROUPING — maps any collection name to a main category ──
-// Categories from image: "Horse Wear > Fly & Insect Control > Fly Boots", "Rider > Accessories & Apparel > Shirts"
-// Parent is the first segment before " > " OR first word(s) of the collection name
+// ── CATEGORY GROUPING — maps Shopify product_type to 5 main categories ──
+// Source: Shopify AI / product_type export confirmed April 2026 (3,021 products)
+// Categories intentionally in English to match dashboard language.
 const CAT_KEYWORDS = {
-  "Rider":      ["rider","apparel","shirt","boot","breeches","helmet","glove","jacket","vest","coat","jean","pant","sock","belt","spur","hat"],
-  "Horse Wear": ["horse wear","horsewear","saddle","pad","girth","blanket","rug","fly boot","fly mask","fly sheet","leg wrap","tendon","bell boot","overreach","tail","mane","exercise"],
-  "Stable":     ["stable","barn","bucket","feeder","hay","feed","bedding","tool","fork","broom","curtain","door","mat","fence"],
-  "Pharmacy":   ["pharmacy","supplement","vitamin","mineral","joint","gastro","vet","wound","liniment","calming","mag","magnesium","liquid","paste","gel","calmer"],
+  "Tack & Equipment":             ["bridle","rein","bridle accessories","saddle pad","all purpose","hunter/jumper","dressage saddle","half pad","stirrup","dressage bridle","belt"],
+  "Rider Apparel & Accessories":  ["apparel","breeches","accessories","hat","shirt","schooling","leather handbag","handbag"],
+  "Horse Care":                   ["detangler","body brace","hoof care","poultice","liniment","relief spray","shampoo","fungal","skin & hair","supplement","personal care"],
+  "Dogs":                         ["dog"],
+  "Stable & Other":               ["stall mat","stall & trailer","trailer cleaning","cavali club","spring 2024","special edition","_elite_gift","elite_gift"],
 };
 
 function getMainCategory(raw) {
-  if (!raw) return "Other";
-  // If it contains " > " it's a hierarchy — take the first part
-  const first = raw.indexOf(" > ") !== -1 ? raw.split(" > ")[0].trim() : raw.trim();
-  const low = first.toLowerCase();
+  // v1.2: raw is now product_type from Shopify, not a collection path
+  if (!raw) return "Uncategorized";
+  const low = raw.trim().toLowerCase();
   for (const [cat, kws] of Object.entries(CAT_KEYWORDS)) {
     if (kws.some(k => low.includes(k))) return cat;
   }
-  // Also try matching raw string for direct category names
-  const rawLow = raw.toLowerCase();
-  for (const [cat, kws] of Object.entries(CAT_KEYWORDS)) {
-    if (rawLow.startsWith(cat.toLowerCase())) return cat;
-    if (kws.some(k => rawLow.includes(k))) return cat;
-  }
-  return "Other";
+  return "Uncategorized";
 }
 
 // ── FETCH ─────────────────────────────────────────────────────────
@@ -390,7 +385,7 @@ function renderSummary(fp){
   $("s-ord").textContent = fmtN(totalOrd);
   $("s-prod").textContent = fmtN(totalUnits);
   $("s-za").textContent  = za;
-  $("s-top1").textContent = fmtP(fp[0]?.pct_revenue||0);
+  $("s-top1").textContent = fmtP(fp[0]?.pct_gp||0);
   $("s-top1-name").textContent = (fp[0]?.product_title||"").split(" ").slice(0,5).join(" ");
   $("s-upd").textContent = (fp[0]?.updated_at||"").slice(0,10)||"—";
 }
@@ -422,7 +417,7 @@ function renderInsight(fp,fh,label){
     generate <strong>80% of Gross Profit</strong> (${fmt$(zaGP)} GP · ${fmt$(zaRev)} Net Sales).
     Top sellers: ${top3}.
     ${fh[0]?` &nbsp;·&nbsp; Top channel: <strong>${fh[0].channel}</strong> (${fmtP(fh[0].pct_revenue)}).`:""}
-    <br><em style="color:var(--tx3);font-size:11px">Ranked by Net Sales · Zone assignment by cumulative Gross Profit (80% = Zone A)</em>`;
+    <br><em style="color:var(--tx3);font-size:11px">Ranked by Gross Profit · Zone assignment by cumulative Gross Profit (80% = Zone A)</em>`;
 }
 
 // ── PRODUCTS TABLE ────────────────────────────────────────────────
@@ -440,12 +435,12 @@ function renderProducts(rows){
   const show=rows.slice(0,50);
   el.innerHTML=`<table><thead><tr>
     <th>#</th><th>Zone</th><th>Product</th>
-    <th class="r">Net Sales</th>
-    <th class="r">% NS</th>
-    <th class="r">Cum. NS</th>
     <th class="r gp-col">Gross Profit</th>
     <th class="r gp-col">GP%</th>
     <th class="r gp-col">Cum. GP</th>
+    <th class="r">Net Sales</th>
+    <th class="r">% NS</th>
+    <th class="r">Cum. NS</th>
     <th class="r">Units</th><th class="r">Orders</th><th>Top Channel</th>
   </tr></thead><tbody>${show.map(r=>{
     cumNS += parseFloat(r.net_sales||0);
@@ -457,12 +452,12 @@ function renderProducts(rows){
       <td style="font-family:'DM Mono',monospace;font-size:10px;color:var(--tx3)">${r.rank}</td>
       <td><span class="zone ${zCls(r.pareto_zone)}">${r.pareto_zone}</span></td>
       <td class="name">${r.product_title||"—"}<small>${r.product_type||""}</small></td>
-      <td class="r">${fmt$(r.net_sales)}</td>
-      <td class="r" style="font-family:'DM Mono',monospace">${pctNS}%</td>
-      <td class="r"><span class="cum-badge cum-gs">${cumNSpct}%</span></td>
       <td class="r gp-sep" style="color:${gpClr(r.gp_pct)};font-weight:500">${fmt$(r.gross_profit)}</td>
       <td class="r" style="color:${gpClr(r.gp_pct)};font-family:'DM Mono',monospace">${fmtP(r.gp_pct)}</td>
       <td class="r"><span class="cum-badge cum-gp">${cumGPpct}%</span></td>
+      <td class="r">${fmt$(r.net_sales)}</td>
+      <td class="r" style="font-family:'DM Mono',monospace">${pctNS}%</td>
+      <td class="r"><span class="cum-badge cum-gs">${cumNSpct}%</span></td>
       <td class="r">${fmtN(r.units)}</td>
       <td class="r">${fmtN(r.orders)}</td>
       <td style="font-size:10px;color:var(--tx3)">${r.top_channel||"—"}</td>
@@ -493,15 +488,16 @@ function groupByMainCategory(rows) {
   Object.values(groups).forEach(g => {
     g.gp_pct = g.net_sales > 0 ? ((g.gross_profit / g.net_sales) * 100).toFixed(1) : "0.0";
   });
-  return Object.values(groups).sort((a,b) => b.net_sales - a.net_sales);
+  return Object.values(groups).sort((a,b) => b.gross_profit - a.gross_profit); // v1.2: sort by GP
 }
 
 const CAT_COLORS = {
-  "Rider":      "#72AEFF",
-  "Horse Wear": "#2EE896",
-  "Stable":     "#D8B054",
-  "Pharmacy":   "#F06868",
-  "Other":      "#72706A",
+  "Tack & Equipment":             "#72AEFF",
+  "Rider Apparel & Accessories":  "#2EE896",
+  "Horse Care":                   "#D8B054",
+  "Dogs":                         "#F06868",
+  "Stable & Other":               "#A090FF",
+  "Uncategorized":                "#72706A",
 };
 
 function renderCategoryChart(grouped) {
@@ -630,17 +626,25 @@ function renderCategories(rawRows) {
 const CH_COLORS={"Wellington (POS)":"#D8B054","Concierge":"#A090FF","Online (Ecom)":"#72AEFF","Others":"#888"};
 function renderChannels(rows){
   const sumEl=$("ch-summary");
-  if(!rows.length){sumEl.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
+  const el=$("ch-grid");el.innerHTML="";
+  if(!rows.length){sumEl.innerHTML="";el.innerHTML=`<div class="empty" style="grid-column:1/-1">No data.</div>`;return;}
   const totalNS=rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
   sumEl.innerHTML=`<div class="sum-grid">${rows.map(r=>{
     const c=CH_COLORS[r.channel]||"#888";
     const pctNS=((parseFloat(r.net_sales||0)/totalNS)*100).toFixed(1);
     return `<div class="sum-card"><div class="sum-label" style="color:${c}">${r.channel}</div>
       <div class="sum-v" style="color:${c}">${fmt$(r.net_sales)}</div>
-      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(r.orders)} orders · ${fmtN(r.units)} units</div>
-      <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:9px;overflow:hidden"><div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${c}"></div></div>
-    </div>`;
+      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(r.orders)} orders</div></div>`;
   }).join("")}</div>`;
+  rows.forEach(r=>{
+    const c=CH_COLORS[r.channel]||"#888";
+    const d=document.createElement("div");d.className="chc";
+    d.innerHTML=`<div class="chc-name">${r.channel}</div>
+      <div class="chc-v" style="color:${c}">${fmt$(r.net_sales)}</div>
+      <div class="chc-sub">${fmtP(r.pct_revenue)} &nbsp;·&nbsp; ${fmtN(r.orders)} orders &nbsp;·&nbsp; ${fmtN(r.units)} units</div>
+      <div class="chc-bar"><div class="chc-barf" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${c}"></div></div>`;
+    el.appendChild(d);
+  });
 }
 
 // ── NEW VS RETURNING ──────────────────────────────────────────────
@@ -670,16 +674,16 @@ function renderCustomers(rows, allProducts){
   // Calculate total GP from all products for the period
   const totalGP = allProducts.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0)||1;
   const totalNS = rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
-  // Top 25 GP sum — estimate based on NS ratio (actual GP per customer not in customers sheet)
-  const top25NS = rows.slice(0,25).reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
-  const top25pct = ((top25NS/totalNS)*100).toFixed(1);
-  $("cust-note").textContent = `Top 25 = ${top25pct}% of Net Sales · Zone A = strategic accounts`;
+  // Top 50 GP sum — estimate based on NS ratio (actual GP per customer not in customers sheet)
+  const top50NS = rows.slice(0,50).reduce((a,r)=>a+parseFloat(r.net_sales||0),0);
+  const top50pct = ((top50NS/totalNS)*100).toFixed(1);
+  $("cust-note").textContent = `Top 50 = ${top50pct}% of Net Sales · Zone A = strategic accounts`;
 
   el.innerHTML=`<table><thead><tr>
     <th>#</th><th>Zone</th><th>Customer</th><th>Segment</th><th>Concierge</th>
     <th class="r">Net Sales</th><th class="r">% Revenue</th><th class="r">Cumulative</th>
     <th class="r">Orders</th><th class="r">Units</th><th>Last Order</th>
-  </tr></thead><tbody>${rows.slice(0,25).map(r => {
+  </tr></thead><tbody>${rows.slice(0,50).map(r => {
     // Detect concierge tag — field 'tags' or infer from channel
     const hasConcierge = (r.tags || r.top_channel || r.channel || "").toLowerCase().includes("concierge");
     const conciergeCell = hasConcierge
@@ -700,7 +704,7 @@ function renderCustomers(rows, allProducts){
     </tr>`;
   }).join("")}</tbody></table>
   <div style="padding:10px 14px;font-size:10px;color:var(--tx3);border-top:1px solid var(--bd)">
-    Top 25 customers = <strong style="color:var(--tx2)">${top25pct}% of Net Sales</strong> &nbsp;·&nbsp;
+    Top 50 customers = <strong style="color:var(--tx2)">${top50pct}% of Net Sales</strong> &nbsp;·&nbsp;
     <em>Concierge tag is detected from customer channel data in Shopify</em>
   </div>`;
 }
