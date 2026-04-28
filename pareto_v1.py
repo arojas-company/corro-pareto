@@ -1,61 +1,31 @@
 """
-PARETO PIPELINE v1.5 — Equestrian Labs / Corro
-===============================================
-Cambios v1.3 vs v1.2:
-- CHANGED: map_product_type_to_category() ahora usa las 7 categorías que
-  corresponden exactamente a los order tags de Shopify:
-    Horse_Health, Grooming_Tools, Horsewear, Supplements,
-    Tack_Equipment, StableSupplies_Collection, Rider, Uncategorized.
-  Estos tags son asignados automáticamente por Shopify a las órdenes
-  según los tipos de productos que contienen.
-- CHANGED: Dogs ya no existe como categoría separada — los productos de
-  perros caen en Horse_Health o Supplements según su product_type.
-- NOTE: el ordenamiento por Gross Profit DESC se aplica consistentemente
-  tanto en products como en categories (ya introducido en v1.2).
-- NOTE: Los 7 order tags de Shopify son los mismos labels que se usan en
-  el frontend HTML para la sección de categorías y el chart.
+PARETO PIPELINE v1.5.1 — Equestrian Labs / Corro
+=================================================
+FIX v1.5.1: upsert_tab reescrita con estrategia append-only.
+  - Ya NO hace clear + rewrite de todo el sheet en cada run.
+  - Lee las filas existentes, actualiza solo las del período actual in-place.
+  - Append solo filas nuevas (claves que no existían).
+  - Evita el crash "10M cells limit" en backfills de 13 períodos.
+  - Primer run (sheet vacío): inicializa normalmente con clear+write.
 
-Cambios v1.2 vs v1.1:
-- CHANGED: Products and categories now sorted by Gross Profit DESC (previously Net Sales).
-  Zone A still = 80% cumulative GP.
-- CHANGED: build_pareto_categories now uses product_type (mapped to 7 main categories
-  matching Shopify order tags) instead of Shopify collections.
-- ADDED: map_product_type_to_category() helper with confirmed product_type keywords.
-
-Cambios v1.1 vs v1.0:
-- FIXED: duplicación de órdenes. fetch_orders usaba financial_status como
-  lista separada por comas — Shopify REST no soporta eso directamente,
-  hacía múltiples requests y duplicaba. Ahora usa dos requests (paid/refunded)
-  y deduplica por order id. Esperado ~8,800 ordenes en 2025 (no 18.2K).
-- CHANGED: Pareto Zone A ahora se basa en Gross Profit (cum_gp_pct ≤ 80%)
-  en lugar de Net Sales. Así los 403 productos que producen el 80% del GP
-  se marcan como Zone A.
-- ADDED: columna cum_gp_pct (acumulado de Gross Profit %) en pareto_products
-  y pareto_categories.
-- ADDED: columna cum_gs_pct (acumulado de Gross Sales %) — el frontend
-  necesita ambos acumulados.
-
-FIX upsert_tab (crash ValueError: invalid literal for int() with base 10: 'rank'):
-- FIX 1: al leer existing rows del sheet, se saltan filas fantasma donde el
-  valor del key column sea igual al nombre de la columna (header escrito como dato).
-- FIX 2: sort_key es robusto ante valores no numéricos en la columna rank —
-  usa try/except en lugar de int() directo.
+Cambios v1.3: map_product_type_to_category() → 7 categorías = Shopify order tags.
+Cambios v1.2: ordenamiento por GP DESC, categorías por product_type.
+Cambios v1.1: fix duplicación órdenes, Zone A basado en cum_gp_pct ≤ 80%.
 
 Run modes:
-  python pareto_v1.py                     # all periods 2024 → today
-  python pareto_v1.py --only q4_2025     # single quarter
+  python pareto_v1.py                       # full backfill 2024 → today
+  python pareto_v1.py --only q4_2025        # single quarter
   python pareto_v1.py --only full_year_2025
   python pareto_v1.py --only custom --start 2025-01-01 --end 2025-12-31
 
-GitHub Actions secrets required:
-  SHOPIFY_TOKEN_CORRO   GOOGLE_CREDENTIALS   SHEET_ID_CORRO
+GitHub Actions secrets: SHOPIFY_TOKEN_CORRO  GOOGLE_CREDENTIALS  SHEET_ID_CORRO
 """
 
 import os, json, requests, gspread, argparse, calendar
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timedelta, date
+from datetime import datetime, date
 from collections import defaultdict
-import pytz
+import pytz, time
 
 TIMEZONE    = pytz.timezone("America/Bogota")
 API_VERSION = "2024-10"
@@ -67,7 +37,7 @@ SCOPES      = ["https://www.googleapis.com/auth/spreadsheets",
                "https://www.googleapis.com/auth/drive"]
 START_YEAR  = 2024
 
-# ── PERIODS ───────────────────────────────────────────────────────
+# ── PERIODS ──────────────────────────────────────────────────────
 def last_day(y, m):
     return date(y, m, calendar.monthrange(y, m)[1])
 
@@ -103,9 +73,7 @@ def resolve_single(key, start_override=None, end_override=None):
         return qs, qe, key
     raise ValueError(f"Unknown period: {key}. Use full_year_YYYY, qN_YYYY, or custom.")
 
-# ── SHOPIFY REST ──────────────────────────────────────────────────
-import time
-
+# ── SHOPIFY REST ─────────────────────────────────────────────────
 def shopify_get(endpoint, params):
     url = f"https://{STORE_URL}/admin/api/{API_VERSION}/{endpoint}"
     headers = {"X-Shopify-Access-Token": TOKEN}
@@ -117,20 +85,14 @@ def shopify_get(endpoint, params):
             except requests.exceptions.ConnectionError as e:
                 wait = min(2 ** attempt, 60)
                 print(f"    connection error — retrying in {wait}s: {e}")
-                time.sleep(wait)
-                continue
+                time.sleep(wait); continue
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 2 ** attempt))
-                print(f"    rate-limited — waiting {wait}s...")
-                time.sleep(wait)
-                continue
+                print(f"    rate-limited — waiting {wait}s..."); time.sleep(wait); continue
             if r.status_code in (502, 503, 504):
                 wait = min(2 ** attempt, 60)
-                print(f"    {r.status_code} — retrying in {wait}s...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            break
+                print(f"    {r.status_code} — retrying in {wait}s..."); time.sleep(wait); continue
+            r.raise_for_status(); break
         else:
             r.raise_for_status()
         data = r.json()
@@ -144,120 +106,60 @@ def shopify_get(endpoint, params):
         time.sleep(0.3)
     return results
 
-# ── FIX v1.1: fetch_orders sin duplicación ────────────────────────
 def fetch_orders(start, end):
-    """
-    FIXED v1.1: fetch_orders sin duplicación — dos requests separados
-    (paid+partially_paid y partially_refunded+refunded) y deduplicamos por order id.
-    Resultado esperado: ~8,800 órdenes en 2025.
-    """
     print(f"  Fetching orders {start} → {end} (deduplication fix v1.1)...")
-
-    seen_ids = set()
-    all_orders = []
-
+    seen_ids = set(); all_orders = []
     for status in ["paid,partially_paid", "partially_refunded,refunded"]:
         batch = shopify_get("orders.json", {
-            "status": "any",
-            "financial_status": status,
+            "status": "any", "financial_status": status,
             "created_at_min": f"{start}T00:00:00-05:00",
             "created_at_max": f"{end}T23:59:59-05:00",
             "limit": 250,
-            "fields": "id,name,created_at,subtotal_price,total_discounts,"
-                      "source_name,tags,line_items,customer",
+            "fields": "id,name,created_at,subtotal_price,total_discounts,source_name,tags,line_items,customer",
         })
         for o in batch:
             oid = o.get("id")
             if oid and oid not in seen_ids:
-                seen_ids.add(oid)
-                all_orders.append(o)
-
+                seen_ids.add(oid); all_orders.append(o)
     print(f"  → {len(all_orders)} unique orders (after dedup)")
     return all_orders
 
 def shopify_graphql(query, variables=None):
-    """
-    Execute a single Shopify Admin GraphQL query with retry/backoff.
-    """
-    url     = f"https://{STORE_URL}/admin/api/{API_VERSION}/graphql.json"
+    url = f"https://{STORE_URL}/admin/api/{API_VERSION}/graphql.json"
     headers = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
     payload = {"query": query}
-    if variables:
-        payload["variables"] = variables
+    if variables: payload["variables"] = variables
     for attempt in range(8):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=60)
         except requests.exceptions.ConnectionError as e:
-            wait = min(2 ** attempt, 60)
-            print(f"    GQL connection error — retrying in {wait}s: {e}")
-            time.sleep(wait)
-            continue
+            time.sleep(min(2**attempt, 60)); continue
         if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", 2 ** attempt))
-            print(f"    GQL rate-limited — waiting {wait}s...")
-            time.sleep(wait)
-            continue
+            time.sleep(int(r.headers.get("Retry-After", 2**attempt))); continue
         if r.status_code in (502, 503, 504):
-            wait = min(2 ** attempt, 60)
-            print(f"    GQL {r.status_code} — retrying in {wait}s...")
-            time.sleep(wait)
-            continue
+            time.sleep(min(2**attempt, 60)); continue
         r.raise_for_status()
         data = r.json()
         errors = data.get("errors") or []
-        if errors and any(
-            (e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors
-        ):
-            wait = min(2 ** attempt, 60)
-            print(f"    GQL throttled — retrying in {wait}s...")
-            time.sleep(wait)
-            continue
+        if errors and any((e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors):
+            time.sleep(min(2**attempt, 60)); continue
         return data
     raise RuntimeError("GraphQL call failed after 8 attempts")
 
-
 def fetch_products_map():
-    """
-    v1.5: Fetches product/variant metadata via GraphQL for product_type,
-    vendor, and product_id lookups. COGS/gross_profit now come directly
-    from ShopifyQL — this function no longer needs to fetch costs.
-    Returns:
-        vmap  dict[variant_id_str] → {product_id, product_title, sku_parent,
-                                       vendor, product_type}
-        title_map  dict[product_title_lower] → {product_type, vendor, product_id}
-    """
     print("  Fetching product catalogue via GraphQL...")
-
     QUERY = """
     query fetchVariants($cursor: String) {
       productVariants(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
-        edges {
-          node {
-            id
-            sku
-            product {
-              id
-              title
-              vendor
-              productType
-            }
-          }
-        }
+        edges { node { id sku product { id title vendor productType } } }
       }
-    }
-    """
-
-    vmap      = {}
-    title_map = {}  # product_title.lower() → product metadata for ShopifyQL join
-    cursor    = None
-
+    }"""
+    vmap = {}; title_map = {}; cursor = None
     while True:
         data  = shopify_graphql(QUERY, {"cursor": cursor})
         pv    = data.get("data", {}).get("productVariants", {})
-        edges = pv.get("edges", [])
-
-        for edge in edges:
+        for edge in pv.get("edges", []):
             node    = edge["node"]
             vid     = str(node["id"].split("/")[-1])
             product = node.get("product") or {}
@@ -266,182 +168,100 @@ def fetch_products_map():
             title   = product.get("title", "")
             ptype   = product.get("productType") or "Uncategorized"
             vendor  = product.get("vendor", "")
-
-            vmap[vid] = {
-                "product_id":    pid,
-                "product_title": title,
-                "sku_parent":    sku.split("-")[0] if sku else "",
-                "vendor":        vendor,
-                "product_type":  ptype,
-            }
-            # title_map keyed by lowercase title for case-insensitive join with ShopifyQL rows
-            title_map[title.lower()] = {
-                "product_id":   pid,
-                "product_type": ptype,
-                "vendor":       vendor,
-            }
-
+            vmap[vid] = {"product_id": pid, "product_title": title,
+                         "sku_parent": sku.split("-")[0] if sku else "",
+                         "vendor": vendor, "product_type": ptype}
+            title_map[title.lower()] = {"product_id": pid, "product_type": ptype, "vendor": vendor}
         page_info = pv.get("pageInfo", {})
-        if not page_info.get("hasNextPage"):
-            break
-        cursor = page_info["endCursor"]
-        time.sleep(0.3)
-
+        if not page_info.get("hasNextPage"): break
+        cursor = page_info["endCursor"]; time.sleep(0.3)
     print(f"  → {len(vmap)} variants  |  {len(title_map)} unique product titles")
     return vmap, title_map
 
-
 def fetch_shopifyql_sales(start, end):
-    """
-    v1.5: Uses ShopifyQL (shopifyqlQuery) to fetch gross_profit, gross_sales,
-    net_sales, orders, net_items_sold per product_title from Shopify Analytics.
-
-    Query matches exactly the confirmed Shopify AI script.
-    Requires scope: read_reports
-
-    Two separate queries:
-      1. Main: product financials grouped by product_title + product_vendor
-      2. Channel: top sales_channel per product_title (non-fatal if fails)
-
-    Returns list of dicts per product title.
-    """
     print(f"  Fetching ShopifyQL sales {start} → {end}...")
-
     GQL = """
     query shopifyqlSales($q: String!) {
       shopifyqlQuery(query: $q) {
-        tableData {
-          columns { name dataType }
-          rows
-        }
+        tableData { columns { name dataType } rows }
         parseErrors
       }
-    }
-    """
+    }"""
 
     def run_shopifyql(q):
-        """Run a ShopifyQL query, return (cols, rows, errors).
-        shopifyqlQuery requires API version 2025-01+ — use that version specifically.
-        """
-        # Override URL to use 2025-01 where shopifyqlQuery exists
-        url     = f"https://{STORE_URL}/admin/api/2026-01/graphql.json"
+        url = f"https://{STORE_URL}/admin/api/2026-01/graphql.json"
         headers = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
         for attempt in range(8):
             try:
                 r = requests.post(url, headers=headers, json={"query": GQL, "variables": {"q": q}}, timeout=60)
-            except requests.exceptions.ConnectionError as e:
+            except requests.exceptions.ConnectionError:
                 time.sleep(min(2**attempt, 60)); continue
             if r.status_code == 429:
                 time.sleep(int(r.headers.get("Retry-After", 2**attempt))); continue
             if r.status_code in (502, 503, 504):
                 time.sleep(min(2**attempt, 60)); continue
-            r.raise_for_status()
-            d = r.json()
-            throttled = any(
-                (e.get("extensions") or {}).get("code") == "THROTTLED"
-                for e in (d.get("errors") or [])
-            )
-            if throttled:
+            r.raise_for_status(); d = r.json()
+            if any((e.get("extensions") or {}).get("code") == "THROTTLED" for e in (d.get("errors") or [])):
                 time.sleep(min(2**attempt, 60)); continue
             break
         else:
             return [], [], [{"code": "FAILED", "message": "max retries"}]
-        # Log full response for debugging — helps diagnose scope/auth issues
-        raw_errors  = d.get("errors")  # top-level GraphQL errors (auth, scope)
+        raw_errors  = d.get("errors")
         shopifyql_q = (d.get("data") or {}).get("shopifyqlQuery")
-        if raw_errors:
-            print(f"  ✗ GraphQL errors (likely missing scope): {raw_errors}")
+        if raw_errors: print(f"  ✗ GraphQL errors: {raw_errors}")
         if shopifyql_q is None:
-            print(f"  ✗ shopifyqlQuery is null — token missing read_reports scope")
-            print(f"    Full response: {str(d)[:500]}")
-            return [], [], [{"code": "NULL_RESPONSE", "message": "shopifyqlQuery returned null"}]
-        # In API 2026-01 parseErrors is a String scalar, not an object list
-        raw_parse_errs = shopifyql_q.get("parseErrors")
-        if raw_parse_errs:
-            errs = [{"code": "PARSE_ERROR", "message": str(raw_parse_errs)}]
-        else:
-            errs = []
-        table = shopifyql_q.get("tableData") or {}
-        cols  = [c["name"] for c in (table.get("columns") or [])]
-        rows  = table.get("rows") or []
-        if errs:
-            print(f"  ⚠ parseErrors: {raw_parse_errs}")
+            print(f"  ✗ shopifyqlQuery null — missing read_reports scope")
+            return [], [], [{"code": "NULL_RESPONSE", "message": "null"}]
+        raw_pe = shopifyql_q.get("parseErrors")
+        errs   = [{"code": "PARSE_ERROR", "message": str(raw_pe)}] if raw_pe else []
+        table  = shopifyql_q.get("tableData") or {}
+        cols   = [c["name"] for c in (table.get("columns") or [])]
+        rows   = table.get("rows") or []
+        if errs: print(f"  ⚠ parseErrors: {raw_pe}")
         print(f"    → cols={cols}  rows={len(rows)}")
         return cols, rows, errs
 
-    # ── Query 1: product financials ───────────────────────────────────
-    q_main = (
-        f"FROM sales "
-        f"SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
-        f"GROUP BY product_title, product_vendor "
-        f"SINCE {start} UNTIL {end} "
-        f"ORDER BY gross_profit DESC"
-    )
+    q_main = (f"FROM sales SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
+              f"GROUP BY product_title, product_vendor SINCE {start} UNTIL {end} ORDER BY gross_profit DESC")
     cols, rows, errs = run_shopifyql(q_main)
-
     if errs:
-        # Fallback: drop product_vendor, group by product_title only
-        print(f"  ⚠ ShopifyQL main query error — retrying without product_vendor:")
-        for e in errs:
-            print(f"    {e.get('code')} — {e.get('message')}")
-        q_fallback = (
-            f"FROM sales "
-            f"SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
-            f"GROUP BY product_title "
-            f"SINCE {start} UNTIL {end} "
-            f"ORDER BY gross_profit DESC"
-        )
+        print(f"  ⚠ retrying without product_vendor:")
+        for e in errs: print(f"    {e.get('code')} — {e.get('message')}")
+        q_fallback = (f"FROM sales SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
+                      f"GROUP BY product_title SINCE {start} UNTIL {end} ORDER BY gross_profit DESC")
         cols, rows, errs2 = run_shopifyql(q_fallback)
         if errs2:
-            for e in errs2:
-                print(f"  ✗ ShopifyQL fallback failed: {e.get('code')} — {e.get('message')}")
+            for e in errs2: print(f"  ✗ fallback failed: {e.get('code')} — {e.get('message')}")
             return []
-
     if not cols:
-        print("  ⚠ ShopifyQL returned no columns — check read_reports scope on token")
-        return []
+        print("  ⚠ ShopifyQL returned no columns"); return []
 
-    # ── Query 2: top channel per product (non-fatal) ──────────────────
     top_channel_map = {}
     try:
-        q_ch = (
-            f"FROM sales "
-            f"SHOW net_sales "
-            f"GROUP BY product_title, sales_channel "
-            f"SINCE {start} UNTIL {end} "
-            f"ORDER BY net_sales DESC"
-        )
+        q_ch = (f"FROM sales SHOW net_sales GROUP BY product_title, sales_channel "
+                f"SINCE {start} UNTIL {end} ORDER BY net_sales DESC")
         ch_cols, ch_rows, ch_errs = run_shopifyql(q_ch)
         if not ch_errs and ch_cols:
             ch_agg = defaultdict(dict)
             for row in ch_rows:
-                if not isinstance(row, dict):
-                    row = dict(zip(ch_cols, row)) if isinstance(row, list) else {}
-                t  = (row.get("product_title") or "").strip()
+                if not isinstance(row, dict): row = dict(zip(ch_cols, row)) if isinstance(row, list) else {}
+                t = (row.get("product_title") or "").strip()
                 ch = (row.get("sales_channel") or "").strip()
                 ns = float(row.get("net_sales") or 0)
-                if t and ch:
-                    ch_agg[t][ch] = ch_agg[t].get(ch, 0) + ns
-            for t, channels in ch_agg.items():
-                top_channel_map[t] = max(channels, key=channels.get)
+                if t and ch: ch_agg[t][ch] = ch_agg[t].get(ch, 0) + ns
+            for t, channels in ch_agg.items(): top_channel_map[t] = max(channels, key=channels.get)
             print(f"  → channel query: {len(top_channel_map)} products mapped")
-        else:
-            if ch_errs:
-                print(f"  ⚠ channel query error (non-fatal): {ch_errs[0].get('message')}")
+        elif ch_errs:
+            print(f"  ⚠ channel query error (non-fatal): {ch_errs[0].get('message')}")
     except Exception as e:
         print(f"  ⚠ channel query failed (non-fatal): {e}")
 
-    # ── Parse rows ────────────────────────────────────────────────────
-    results = []
-    seen    = set()
+    results = []; seen = set()
     for row in rows:
-        if not isinstance(row, dict):
-            row = dict(zip(cols, row)) if isinstance(row, list) else {}
-        title  = (row.get("product_title")  or "").strip()
+        if not isinstance(row, dict): row = dict(zip(cols, row)) if isinstance(row, list) else {}
+        title  = (row.get("product_title") or "").strip()
         vendor = (row.get("product_vendor") or "").strip()
-        if not title:
-            continue
-        # Deduplicate: if product_title appears multiple times aggregate into one row
+        if not title: continue
         if title in seen:
             for r in results:
                 if r["product_title"] == title:
@@ -453,23 +273,13 @@ def fetch_shopifyql_sales(start, end):
                     break
             continue
         seen.add(title)
-        ns = float(row.get("net_sales")    or 0)
+        ns = float(row.get("net_sales") or 0)
         gp = float(row.get("gross_profit") or 0)
-        gs = float(row.get("gross_sales")  or 0)
-        if gs == 0:
-            gs = ns
-        results.append({
-            "product_title": title,
-            "vendor":        vendor,
-            "gross_profit":  gp,
-            "gross_sales":   gs,
-            "discounts":     max(gs - ns, 0),
-            "net_sales":     ns,
-            "orders":        int(row.get("orders")         or 0),
-            "units":         int(row.get("net_items_sold") or 0),
-            "top_channel":   top_channel_map.get(title, ""),
-        })
-
+        gs = float(row.get("gross_sales") or 0) or ns
+        results.append({"product_title": title, "vendor": vendor, "gross_profit": gp,
+            "gross_sales": gs, "discounts": max(gs - ns, 0), "net_sales": ns,
+            "orders": int(row.get("orders") or 0), "units": int(row.get("net_items_sold") or 0),
+            "top_channel": top_channel_map.get(title, "")})
     print(f"  → {len(results)} products from ShopifyQL")
     return results
 
@@ -483,123 +293,47 @@ def fetch_collections_map():
     print(f"  → {len(colls)} collection titles loaded")
     print("  Fetching all collects...")
     prod_colls = defaultdict(list)
-    all_collects = shopify_get("collects.json", {"limit": 250, "fields": "collection_id,product_id"})
-    for co in all_collects:
-        cid = str(co.get("collection_id", ""))
-        pid = str(co.get("product_id", ""))
+    for co in shopify_get("collects.json", {"limit": 250, "fields": "collection_id,product_id"}):
+        cid = str(co.get("collection_id", "")); pid = str(co.get("product_id", ""))
         title = colls.get(cid)
-        if title and pid and title not in prod_colls[pid]:
-            prod_colls[pid].append(title)
+        if title and pid and title not in prod_colls[pid]: prod_colls[pid].append(title)
     print(f"  → {len(prod_colls)} products mapped to collections")
     return prod_colls
 
-# ── CHANNEL DETECTION ─────────────────────────────────────────────
 def detect_channel(order):
     src  = (order.get("source_name") or "").lower().strip()
     tags = (order.get("tags") or "").lower()
-    if "concierge" in tags or "concierge" in src:
-        return "Concierge"
-    if src == "pos" or "wellington" in tags:
-        return "Wellington (POS)"
+    if "concierge" in tags or "concierge" in src: return "Concierge"
+    if src == "pos" or "wellington" in tags: return "Wellington (POS)"
     return "Online (Ecom)"
 
 def audit_concierge_tags(orders, sample=30):
-    tag_counts = defaultdict(int)
-    concierge_count = 0
+    tag_counts = defaultdict(int); concierge_count = 0
     for o in orders:
-        tags = (o.get("tags") or "").strip()
-        src  = (o.get("source_name") or "").strip()
+        tags = (o.get("tags") or "").strip(); src = (o.get("source_name") or "").strip()
         key  = f"source={src!r:20} | tags={tags[:80]!r}" if (tags or src) else "(no tags)"
         tag_counts[key] += 1
-        if "concierge" in tags.lower() or "concierge" in src.lower():
-            concierge_count += 1
+        if "concierge" in tags.lower() or "concierge" in src.lower(): concierge_count += 1
     print("\n  ── CONCIERGE TAG AUDIT ──────────────────────────────")
     print(f"  Orders matching 'concierge': {concierge_count} / {len(orders)}")
     for k, cnt in sorted(tag_counts.items(), key=lambda x: -x[1])[:sample]:
         print(f"    {cnt:>5}x  {k}")
     print("  ────────────────────────────────────────────────────\n")
 
-# ── CATEGORY MAPPING v1.3 ─────────────────────────────────────────
 def map_product_type_to_category(raw_type):
-    """
-    v1.3: Maps Shopify product_type values to the 7 categories that match
-    exactly the Shopify order tags assigned automatically to orders.
-    """
-    if not raw_type:
-        return "Uncategorized"
+    if not raw_type: return "Uncategorized"
     t = raw_type.strip().lower()
-
-    rider_kw = [
-        "apparel", "breeches", "hat", "shirt", "schooling",
-        "leather handbag", "handbag", "boot bag",
-        "rider", "belt",
-    ]
-    if any(k in t for k in rider_kw):
-        return "Rider"
-
-    tack_kw = [
-        "bridle", "rein", "bridle accessories",
-        "saddle pad", "all purpose", "hunter/jumper", "dressage saddle",
-        "half pad", "stirrup", "dressage bridle",
-        "girth", "breastplate", "martingale", "bit",
-    ]
-    if any(k in t for k in tack_kw):
-        return "Tack_Equipment"
-
-    horsewear_kw = [
-        "blanket", "sheet", "fly wrap", "fly rug", "cooler",
-        "neck cover", "hood", "turnout", "stable rug",
-        "horsewear",
-    ]
-    if any(k in t for k in horsewear_kw):
-        return "Horsewear"
-
-    grooming_kw = [
-        "detangler", "shampoo", "grooming", "brush", "comb",
-        "body brace", "skin & hair", "fungal", "spray",
-    ]
-    if any(k in t for k in grooming_kw):
-        return "Grooming_Tools"
-
-    supplement_kw = [
-        "supplement", "electrolyte", "vitamin", "probiotic",
-        "omega", "joint", "performance",
-    ]
-    if any(k in t for k in supplement_kw):
-        return "Supplements"
-
-    health_kw = [
-        "hoof care", "poultice", "liniment", "relief",
-        "wound", "ointment", "pharmaceutical", "therapeutic",
-        "ulcer", "gastric", "back on track",
-        "dog",
-        "personal care",
-    ]
-    if any(k in t for k in health_kw):
-        return "Horse_Health"
-
-    stable_kw = [
-        "stall mat", "stall & trailer", "trailer cleaning",
-        "stall", "stable supply", "cleaning", "bag",
-        "cavali club", "spring 2024", "special edition",
-        "_elite_gift", "elite_gift",
-    ]
-    if any(k in t for k in stable_kw):
-        return "StableSupplies_Collection"
-
-    if "accessories" in t:
-        return "Rider"
-
+    if any(k in t for k in ["apparel","breeches","hat","shirt","schooling","leather handbag","handbag","boot bag","rider","belt"]): return "Rider"
+    if any(k in t for k in ["bridle","rein","bridle accessories","saddle pad","all purpose","hunter/jumper","dressage saddle","half pad","stirrup","dressage bridle","girth","breastplate","martingale","bit"]): return "Tack_Equipment"
+    if any(k in t for k in ["blanket","sheet","fly wrap","fly rug","cooler","neck cover","hood","turnout","stable rug","horsewear"]): return "Horsewear"
+    if any(k in t for k in ["detangler","shampoo","grooming","brush","comb","body brace","skin & hair","fungal","spray"]): return "Grooming_Tools"
+    if any(k in t for k in ["supplement","electrolyte","vitamin","probiotic","omega","joint","performance"]): return "Supplements"
+    if any(k in t for k in ["hoof care","poultice","liniment","relief","wound","ointment","pharmaceutical","therapeutic","ulcer","gastric","back on track","dog","personal care"]): return "Horse_Health"
+    if any(k in t for k in ["stall mat","stall & trailer","trailer cleaning","stall","stable supply","cleaning","bag","cavali club","spring 2024","special edition","_elite_gift","elite_gift"]): return "StableSupplies_Collection"
+    if "accessories" in t: return "Rider"
     return "Uncategorized"
 
-
-# ── AGGREGATION ─────────────────────────────────────────────────────
 def build_pareto_products(shopifyql_rows, title_map, orders):
-    """
-    v1.5: All financials come directly from ShopifyQL.
-    product_type comes from title_map (GraphQL catalogue).
-    top_channel from ShopifyQL channel query or fallback to order-level detection.
-    """
     channel_agg = defaultdict(lambda: defaultdict(float))
     for order in orders:
         ch = detect_channel(order)
@@ -610,9 +344,7 @@ def build_pareto_products(shopifyql_rows, title_map, orders):
             pid   = str(li.get("product_id") or "")
             price = float(li.get("price", 0) or 0) * int(li.get("quantity", 0) or 0)
             net   = max(price - disc_per_li, 0)
-            if pid:
-                channel_agg[pid][ch] += net
-
+            if pid: channel_agg[pid][ch] += net
     agg = {}
     for row in shopifyql_rows:
         title  = row["product_title"]
@@ -620,50 +352,23 @@ def build_pareto_products(shopifyql_rows, title_map, orders):
         pid    = meta.get("product_id", "")
         ptype  = meta.get("product_type", "Uncategorized")
         vendor = row.get("vendor") or meta.get("vendor", "")
-        top_ch = row.get("top_channel") or (
-            max(channel_agg[pid], key=channel_agg[pid].get)
-            if channel_agg.get(pid) else ""
-        )
-        gp        = row["gross_profit"]
-        ns        = row["net_sales"]
-        gp_pct    = round(gp / ns * 100, 1) if ns else 0.0
-        cogs      = max(ns - gp, 0)
-        discounts = row.get("discounts") or max(row.get("gross_sales", ns) - ns, 0)
-
-        agg[title] = {
-            "product_id":    pid,
-            "product_title": title,
-            "product_type":  ptype,
-            "vendor":        vendor,
-            "sku_parent":    "",
-            "gross_sales":   row.get("gross_sales", ns),
-            "discounts":     discounts,
-            "net_sales":     ns,
-            "cogs":          cogs,
-            "gross_profit":  gp,
-            "gp_pct":        gp_pct,
-            "units":         row["units"],
-            "orders":        row["orders"],
-            "top_channel":   top_ch,
-        }
+        top_ch = row.get("top_channel") or (max(channel_agg[pid], key=channel_agg[pid].get) if channel_agg.get(pid) else "")
+        gp = row["gross_profit"]; ns = row["net_sales"]
+        agg[title] = {"product_id": pid, "product_title": title, "product_type": ptype,
+            "vendor": vendor, "sku_parent": "",
+            "gross_sales": row.get("gross_sales", ns),
+            "discounts": row.get("discounts") or max(row.get("gross_sales", ns) - ns, 0),
+            "net_sales": ns, "cogs": max(ns - gp, 0), "gross_profit": gp,
+            "gp_pct": round(gp / ns * 100, 1) if ns else 0.0,
+            "units": row["units"], "orders": row["orders"], "top_channel": top_ch}
     return agg
 
-
 def build_pareto_categories(shopifyql_rows, title_map):
-    """
-    v1.5: Aggregates ShopifyQL product rows into 7 order-tag categories.
-    """
-    agg = defaultdict(lambda: {
-        "gross_sales": 0.0, "discounts": 0.0, "net_sales": 0.0,
-        "cogs": 0.0, "gross_profit": 0.0, "units": 0, "orders": 0,
-    })
+    agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"cogs":0.0,"gross_profit":0.0,"units":0,"orders":0})
     for row in shopifyql_rows:
-        title  = row["product_title"]
-        meta   = title_map.get(title.lower(), {})
-        ptype  = meta.get("product_type", "Uncategorized")
-        cat    = map_product_type_to_category(ptype)
-        ns     = row["net_sales"]
-        gp     = row["gross_profit"]
+        meta = title_map.get(row["product_title"].lower(), {})
+        cat  = map_product_type_to_category(meta.get("product_type", "Uncategorized"))
+        ns = row["net_sales"]; gp = row["gross_profit"]
         agg[cat]["gross_sales"]  += row["gross_sales"]
         agg[cat]["discounts"]    += max(row["gross_sales"] - ns, 0)
         agg[cat]["net_sales"]    += ns
@@ -676,36 +381,25 @@ def build_pareto_categories(shopifyql_rows, title_map):
 def build_pareto_channels(orders):
     agg = defaultdict(lambda: {"gross_sales":0.0,"discounts":0.0,"net_sales":0.0,"units":0,"orders":set()})
     for order in orders:
-        ch   = detect_channel(order)
+        ch = detect_channel(order)
         disc = float(order.get("total_discounts",0) or 0)
         sub  = float(order.get("subtotal_price",0) or 0)
         units = sum(int(li.get("quantity",0) or 0) for li in order.get("line_items",[]))
-        agg[ch]["gross_sales"] += sub + disc
-        agg[ch]["discounts"]   += disc
-        agg[ch]["net_sales"]   += sub
-        agg[ch]["units"]       += units
-        agg[ch]["orders"].add(order["id"])
+        agg[ch]["gross_sales"] += sub + disc; agg[ch]["discounts"] += disc
+        agg[ch]["net_sales"] += sub; agg[ch]["units"] += units; agg[ch]["orders"].add(order["id"])
     return agg
 
 def build_pareto_customers(orders, period_start):
     agg = defaultdict(lambda: {"customer_id":"","name":"","email":"","gross_sales":0.0,"net_sales":0.0,"orders":0,"units":0,"first_order":"9999-99-99","last_order":"0000-00-00","is_new":True})
     for order in orders:
-        c    = order.get("customer") or {}
-        cid  = str(c.get("id", f"guest_{order['id']}"))
-        sub  = float(order.get("subtotal_price",0) or 0)
-        disc = float(order.get("total_discounts",0) or 0)
+        c = order.get("customer") or {}; cid = str(c.get("id", f"guest_{order['id']}"))
+        sub = float(order.get("subtotal_price",0) or 0); disc = float(order.get("total_discounts",0) or 0)
         units = sum(int(li.get("quantity",0) or 0) for li in order.get("line_items",[]))
-        d    = order.get("created_at","")[:10]
-        is_new = (c.get("created_at") or d)[:10] >= str(period_start)
-        row  = agg[cid]
-        row["customer_id"]  = cid
-        row["name"]         = f"{c.get('first_name','')} {c.get('last_name','')}".strip() or "Guest"
-        row["email"]        = c.get("email","")
-        row["gross_sales"] += sub + disc
-        row["net_sales"]   += sub
-        row["orders"]      += 1
-        row["units"]       += units
-        row["is_new"]       = is_new
+        d = order.get("created_at","")[:10]; is_new = (c.get("created_at") or d)[:10] >= str(period_start)
+        row = agg[cid]
+        row["customer_id"] = cid; row["name"] = f"{c.get('first_name','')} {c.get('last_name','')}".strip() or "Guest"
+        row["email"] = c.get("email",""); row["gross_sales"] += sub + disc; row["net_sales"] += sub
+        row["orders"] += 1; row["units"] += units; row["is_new"] = is_new
         if d < row["first_order"]: row["first_order"] = d
         if d > row["last_order"]:  row["last_order"]  = d
     return agg
@@ -717,31 +411,13 @@ def build_new_vs_returning(agg_cust):
         s[k]["count"] += 1; s[k]["net_sales"] += d["net_sales"]; s[k]["orders"] += d["orders"]
     return s
 
-# ── PARETO COLUMNS — v1.1 / v1.2 ─────────────────────────────────
 def add_pareto_cols(rows, revenue_key="net_sales", gp_key="gross_profit"):
-    """
-    - pct_revenue y cum_pct sobre net_sales (ranking)
-    - pct_gs y cum_gs_pct sobre gross_sales
-    - pct_gp y cum_gp_pct sobre gross_profit
-    - pareto_zone asignado por cum_gp_pct:
-        Zone A: cum_gp_pct <= 80%
-        Zone B: cum_gp_pct <= 95%
-        Zone C: resto
-    Rows deben estar pre-ordenados por gross_profit DESC antes de llamar esta función.
-    """
     total_rev = sum(r.get(revenue_key, 0) for r in rows) or 1
     total_gs  = sum(r.get("gross_sales", 0) for r in rows) or 1
     total_gp  = sum(r.get(gp_key, 0) for r in rows) or 1
-
-    cum_rev = 0.0
-    cum_gs  = 0.0
-    cum_gp  = 0.0
-
+    cum_rev = cum_gs = cum_gp = 0.0
     for i, r in enumerate(rows):
-        cum_rev += r.get(revenue_key, 0)
-        cum_gs  += r.get("gross_sales", 0)
-        cum_gp  += r.get(gp_key, 0)
-
+        cum_rev += r.get(revenue_key, 0); cum_gs += r.get("gross_sales", 0); cum_gp += r.get(gp_key, 0)
         r["rank"]        = i + 1
         r["pct_revenue"] = round(r.get(revenue_key, 0) / total_rev * 100, 2)
         r["cum_pct"]     = round(cum_rev / total_rev * 100, 2)
@@ -749,12 +425,10 @@ def add_pareto_cols(rows, revenue_key="net_sales", gp_key="gross_profit"):
         r["cum_gs_pct"]  = round(cum_gs / total_gs * 100, 2)
         r["pct_gp"]      = round(r.get(gp_key, 0) / total_gp * 100, 2)
         r["cum_gp_pct"]  = round(cum_gp / total_gp * 100, 2)
-        # Zone based on cumulative GP
         r["pareto_zone"] = "A" if r["cum_gp_pct"] <= 80 else ("B" if r["cum_gp_pct"] <= 95 else "C")
-
     return rows, total_rev
 
-# ── SHEETS ────────────────────────────────────────────────────────
+# ── SHEETS ───────────────────────────────────────────────────────
 def get_gc():
     creds = Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
     return gspread.authorize(creds)
@@ -767,91 +441,146 @@ def sheets_call(fn, *args, **kwargs):
             status = e.response.status_code if hasattr(e, "response") else 0
             if status == 429 or status >= 500:
                 wait = min(15 * (attempt + 1), 90)
-                print(f"    Sheets API {status} — waiting {wait}s...")
-                time.sleep(wait)
-                continue
+                print(f"    Sheets API {status} — waiting {wait}s..."); time.sleep(wait); continue
             raise
         except Exception as e:
-            if attempt < 3:
-                print(f"    Sheets error, retrying: {e}")
-                time.sleep(10)
-                continue
+            if attempt < 3: print(f"    Sheets error, retrying: {e}"); time.sleep(10); continue
             raise
     raise RuntimeError("Sheets call failed after 8 attempts")
 
-def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
-    BATCH_SIZE   = 500
-    SLEEP_BATCH  = 2.0
-    SLEEP_TAB    = 5.0
+def _clean_row(row):
+    out = []
+    for v in row:
+        if v is None: out.append("")
+        elif isinstance(v, float) and v != v: out.append("")
+        elif hasattr(v, "strftime"): out.append(v.strftime("%Y-%m-%d"))
+        elif not isinstance(v, (int, float, bool)): out.append(str(v))
+        else: out.append(v)
+    return out
 
-    try:    ws = sh.worksheet(tab_name)
-    except: ws = sheets_call(sh.add_worksheet, tab_name, rows=max(5000, len(new_rows)+100), cols=len(headers)+2)
-    time.sleep(2)
-
-    existing = {}
-    try:
-        vals = sheets_call(ws.get_all_values)
-        if len(vals) >= 2:
-            ex_h = vals[0]
-            for r in vals[1:]:
-                m = {ex_h[i]: (r[i] if i < len(r) else "") for i in range(len(ex_h))}
-                # ✅ FIX 1: skip phantom header rows — value equals column name
-                if any(str(m.get(c, "")).strip() == c for c in key_cols):
-                    continue
-                k = tuple(str(m.get(c, "")).strip() for c in key_cols)
-                if any(k): existing[k] = [m.get(h, "") for h in headers]
-    except Exception as e:
-        print(f"    Warning reading {tab_name}: {e}")
-
-    for row in new_rows:
-        m = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        k = tuple(str(m.get(c, "")).strip() for c in key_cols)
-        existing[k] = row
-
-    # ✅ FIX 2: sort_key robusto — nunca crashea con valores no numéricos en rank
-    def sort_key(r):
-        m = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
-        try:
-            rank_val = int(m.get("rank", 0) or 0)
-        except (ValueError, TypeError):
-            rank_val = 0
-        return (
-            str(m.get("period_start", "") or ""),
-            str(m.get("period", "")       or ""),
-            rank_val,
-        )
-
-    merged = sorted(existing.values(), key=sort_key)
-    all_data = [headers]
-    for r in merged:
-        clean = []
-        for v in r:
-            if v is None: clean.append("")
-            elif isinstance(v, float) and (v != v): clean.append("")
-            elif hasattr(v, 'strftime'): clean.append(v.strftime("%Y-%m-%d"))
-            else: clean.append(str(v) if not isinstance(v,(int,float,bool)) else v)
-        all_data.append(clean)
-
-    total_rows = len(all_data)
-    if total_rows > ws.row_count or len(headers) > ws.col_count:
-        sheets_call(ws.resize, rows=total_rows+50, cols=len(headers)+2)
-        time.sleep(1)
-
-    sheets_call(ws.clear)
-    time.sleep(1)
-
-    written = 0
-    for i in range(0, len(all_data), BATCH_SIZE):
-        batch = all_data[i:i+BATCH_SIZE]
+def _batch_append(ws, rows, batch_size, sleep_batch, tab_name):
+    written = 0; total = len(rows)
+    for i in range(0, total, batch_size):
+        batch = rows[i:i + batch_size]
         sheets_call(ws.append_rows, batch, value_input_option="RAW", insert_data_option="INSERT_ROWS")
         written += len(batch)
-        print(f"    {tab_name}: {written}/{total_rows} rows written...")
-        if i+BATCH_SIZE < len(all_data): time.sleep(SLEEP_BATCH)
+        print(f"    {tab_name}: {written}/{total} rows appended...")
+        if i + batch_size < total: time.sleep(sleep_batch)
+
+
+# ── upsert_tab v1.5.1 — APPEND-ONLY (no full clear+rewrite) ──────
+#
+# HOW IT WORKS:
+#   1. Read the full sheet once.
+#   2. For rows whose period is in the current batch:
+#        - If the composite key (e.g. period+product_id) already exists → batch_update that row.
+#        - If the key is new → append.
+#   3. Rows from OTHER periods are never touched.
+#
+# RESULT: each run writes at most ~1000 rows × 25 cols per tab per period.
+# No more 10M-cell explosion regardless of how many historical periods exist.
+#
+def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
+    BATCH_SIZE  = 500
+    SLEEP_BATCH = 2.0
+    SLEEP_TAB   = 4.0
+
+    # Get or create worksheet
+    try:
+        ws = sh.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = sheets_call(sh.add_worksheet, tab_name,
+                         rows=max(2000, len(new_rows) + 100), cols=len(headers) + 2)
+    time.sleep(2)
+
+    # Read existing sheet
+    try:
+        existing_vals = sheets_call(ws.get_all_values)
+    except Exception as e:
+        print(f"    Warning reading {tab_name}: {e}"); existing_vals = []
+
+    ex_h     = existing_vals[0] if existing_vals else []
+    ex_h_idx = {h: i for i, h in enumerate(ex_h)}
+
+    # Collect which periods we are writing in this batch
+    period_col_idx = headers.index("period") if "period" in headers else None
+    periods_in_batch = set()
+    if period_col_idx is not None:
+        for row in new_rows:
+            if period_col_idx < len(row):
+                periods_in_batch.add(str(row[period_col_idx]).strip())
+
+    # Index new rows by composite key
+    def make_key(row, h):
+        return tuple(str(row[h.index(c)] if c in h else "").strip() for c in key_cols)
+
+    new_index = {make_key(row, headers): row for row in new_rows}
+
+    # ── FIRST RUN: sheet empty or wrong headers → clear + full write ──
+    if not existing_vals or ex_h != headers:
+        print(f"    {tab_name}: initializing (first run or header change)")
+        all_data = [headers] + [_clean_row(r) for r in new_rows]
+        needed   = len(all_data) + 200
+        if ws.row_count < needed or ws.col_count < len(headers) + 2:
+            sheets_call(ws.resize, rows=max(ws.row_count, needed),
+                        cols=max(ws.col_count, len(headers) + 2)); time.sleep(1)
+        sheets_call(ws.clear); time.sleep(1)
+        _batch_append(ws, all_data, BATCH_SIZE, SLEEP_BATCH, tab_name)
+        time.sleep(SLEEP_TAB)
+        print(f"    ok {tab_name}: {len(new_rows)} rows written (init)")
+        return
+
+    # ── INCREMENTAL: find existing rows for our periods ───────────────
+    period_col_ex      = ex_h_idx.get("period")
+    key_col_ex_indices = [ex_h_idx.get(c) for c in key_cols]
+
+    existing_key_to_sheetrow = {}
+    if period_col_ex is not None:
+        for data_idx, data_row in enumerate(existing_vals[1:], start=1):
+            period_val = (data_row[period_col_ex] if period_col_ex < len(data_row) else "").strip()
+            if period_val not in periods_in_batch: continue
+            k = tuple(
+                str(data_row[i]).strip() if (i is not None and i < len(data_row)) else ""
+                for i in key_col_ex_indices
+            )
+            # data_idx is 1-based within existing_vals[1:], so sheet row = data_idx + 1
+            existing_key_to_sheetrow[k] = data_idx + 1
+
+    rows_to_update = []
+    rows_to_append = []
+    for k, row in new_index.items():
+        clean = _clean_row(row)
+        if k in existing_key_to_sheetrow:
+            rows_to_update.append((existing_key_to_sheetrow[k], clean))
+        else:
+            rows_to_append.append(clean)
+
+    # Batch-update existing rows via batch_update (no clear needed)
+    if rows_to_update:
+        for i in range(0, len(rows_to_update), BATCH_SIZE):
+            batch = rows_to_update[i:i + BATCH_SIZE]
+            data  = []
+            for sheet_row_num, clean_row in batch:
+                r1 = gspread.utils.rowcol_to_a1(sheet_row_num, 1)
+                r2 = gspread.utils.rowcol_to_a1(sheet_row_num, len(headers))
+                data.append({"range": f"{r1}:{r2}", "values": [clean_row]})
+            sheets_call(ws.batch_update, data, value_input_option="RAW")
+            print(f"    {tab_name}: updated {min(i+BATCH_SIZE, len(rows_to_update))}/{len(rows_to_update)} rows...")
+            if i + BATCH_SIZE < len(rows_to_update): time.sleep(SLEEP_BATCH)
+
+    # Append brand-new rows
+    if rows_to_append:
+        current_total = len(existing_vals) + len(rows_to_append) + 50
+        if current_total > ws.row_count:
+            sheets_call(ws.resize, rows=current_total + 200,
+                        cols=max(ws.col_count, len(headers) + 2)); time.sleep(1)
+        _batch_append(ws, rows_to_append, BATCH_SIZE, SLEEP_BATCH, tab_name)
 
     time.sleep(SLEEP_TAB)
-    print(f"    ok {tab_name}: {len(new_rows)} new rows, {len(merged)} total")
+    print(f"    ok {tab_name}: {len(rows_to_update)} updated + {len(rows_to_append)} appended")
 
-# ── MAIN ──────────────────────────────────────────────────────────
+
+# ── MAIN ─────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--only", default=None)
@@ -862,15 +591,15 @@ def main():
     periods = [resolve_single(args.only, args.start, args.end)] if args.only else build_all_periods()
 
     print(f"\n{'='*60}")
-    print(f"  PARETO PIPELINE v1.5 — Corro ({STORE_URL})")
+    print(f"  PARETO PIPELINE v1.5.1 — Corro ({STORE_URL})")
     print(f"  Mode  : {'single ('+args.only+')' if args.only else 'full backfill — '+str(len(periods))+' periods'}")
     print(f"  Sheet : {SHEET_ID}")
-    print(f"  v1.5  : ShopifyQL gross_profit · 7 order-tag categories · GP-sorted")
+    print(f"  v1.5.1: append-only upsert · no 10M cell crash")
     print(f"{'='*60}\n")
 
     vmap, title_map = fetch_products_map()
     prod_colls      = fetch_collections_map()
-    sh           = get_gc().open_by_key(SHEET_ID)
+    sh = get_gc().open_by_key(SHEET_ID)
 
     h_prod = ["updated_at","period","period_start","period_end","rank","pareto_zone",
               "product_title","product_type","vendor","sku_parent","product_id",
@@ -879,11 +608,9 @@ def main():
               "cogs","gross_profit","gp_pct","pct_gp","cum_gp_pct",
               "units","orders","top_channel"]
     h_cat  = ["updated_at","period","period_start","period_end","rank","pareto_zone",
-              "category",
-              "gross_sales","pct_gs","cum_gs_pct",
+              "category","gross_sales","pct_gs","cum_gs_pct",
               "net_sales","pct_revenue","cum_pct",
-              "cogs","gross_profit","gp_pct","pct_gp","cum_gp_pct",
-              "units","orders"]
+              "cogs","gross_profit","gp_pct","pct_gp","cum_gp_pct","units","orders"]
     h_ch   = ["updated_at","period","period_start","period_end","rank","pareto_zone",
               "channel","gross_sales","discounts","net_sales","pct_revenue","cum_pct","units","orders"]
     h_cust = ["updated_at","period","period_start","period_end","rank","pareto_zone",
@@ -898,45 +625,31 @@ def main():
     for idx, (start, end, pk) in enumerate(periods):
         print(f"\n[{idx+1}/{len(periods)}] {pk}  ({start} → {end})")
         orders = fetch_orders(start, end)
-        if not orders:
-            print("  ⚠ No orders — skipping"); continue
+        if not orders: print("  ⚠ No orders — skipping"); continue
 
-        if first_run:
-            audit_concierge_tags(orders)
-            first_run = False
+        if first_run: audit_concierge_tags(orders); first_run = False
 
         sq_rows = fetch_shopifyql_sales(start, end)
         if not sq_rows:
-            print("  ⚠ ShopifyQL returned 0 rows — skipping products/categories for this period")
-            print("    Check that token has read_reports scope.")
-            ah  = build_pareto_channels(orders)
-            au  = build_pareto_customers(orders, start)
+            print("  ⚠ ShopifyQL returned 0 rows — skipping products/categories")
+            ah = build_pareto_channels(orders); au = build_pareto_customers(orders, start)
             nvr = build_new_vs_returning(au)
             raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
                      "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
             rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-            all_ch += [[
-                now_str, pk, str(start), str(end),
-                r["rank"], r["pareto_zone"], r["channel"],
-                round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
-                r["pct_revenue"], r["cum_pct"], r["units"], r["orders"]
-            ] for r in rs]
+            all_ch += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["channel"],
+                round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
+                r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
             raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
             rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-            all_cust += [[
-                now_str, pk, str(start), str(end),
-                r["rank"], r["pareto_zone"],
-                r["customer_id"], r["name"], r["email"], r["segment"],
-                round(r["net_sales"],2), r["pct_revenue"], r["cum_pct"],
-                r["orders"], r["units"], r["first_order"], r["last_order"]
-            ] for r in rs]
-            tc = sum(v["count"] for v in nvr.values()) or 1
-            tr = sum(v["net_sales"] for v in nvr.values()) or 1
+            all_cust += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
+                r["customer_id"],r["name"],r["email"],r["segment"],round(r["net_sales"],2),
+                r["pct_revenue"],r["cum_pct"],r["orders"],r["units"],r["first_order"],r["last_order"]] for r in rs]
+            tc = sum(v["count"] for v in nvr.values()) or 1; tr = sum(v["net_sales"] for v in nvr.values()) or 1
             for seg, v in nvr.items():
-                all_nvr.append([now_str, pk, str(start), str(end), seg.capitalize(),
-                    v["count"], round(v["net_sales"],2), v["orders"],
-                    round(v["count"]/tc*100,1), round(v["net_sales"]/tr*100,1)])
-            print(f"  → {len(orders)} orders | channels/customers written | products SKIPPED (ShopifyQL empty)")
+                all_nvr.append([now_str,pk,str(start),str(end),seg.capitalize(),
+                    v["count"],round(v["net_sales"],2),v["orders"],
+                    round(v["count"]/tc*100,1),round(v["net_sales"]/tr*100,1)])
             continue
 
         ap  = build_pareto_products(sq_rows, title_map, orders)
@@ -945,69 +658,46 @@ def main():
         au  = build_pareto_customers(orders, start)
         nvr = build_new_vs_returning(au)
 
-        # Products — sorted by gross_profit DESC, zones by cumulative GP
         raws = list(ap.values())
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
-        all_prod += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"],
-            r["product_title"], r["product_type"], r["vendor"], r["sku_parent"], r["product_id"],
-            round(r["gross_sales"],2), r["pct_gs"], r["cum_gs_pct"],
-            round(r["net_sales"],2),   r["pct_revenue"], r["cum_pct"],
-            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"], r["pct_gp"], r["cum_gp_pct"],
-            r["units"], r["orders"], r["top_channel"]
-        ] for r in rs]
+        all_prod += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
+            r["product_title"],r["product_type"],r["vendor"],r["sku_parent"],r["product_id"],
+            round(r["gross_sales"],2),r["pct_gs"],r["cum_gs_pct"],
+            round(r["net_sales"],2),r["pct_revenue"],r["cum_pct"],
+            round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],r["pct_gp"],r["cum_gp_pct"],
+            r["units"],r["orders"],r["top_channel"]] for r in rs]
 
-        # Categories — sorted by gross_profit DESC, zones by cumulative GP
         raws = []
         for cat, d in ac.items():
             gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
-            raws.append({
-                "category":cat,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
+            raws.append({"category":cat,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
                 "discounts":d["discounts"],"units":d["units"],"orders":d["orders"],
-                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp
-            })
+                "cogs":d["cogs"],"gross_profit":d["gross_profit"],"gp_pct":gp})
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
-        all_cat += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["category"],
-            round(r["gross_sales"],2), r["pct_gs"], r["cum_gs_pct"],
-            round(r["net_sales"],2),   r["pct_revenue"], r["cum_pct"],
-            round(r["cogs"],2), round(r["gross_profit"],2), r["gp_pct"], r["pct_gp"], r["cum_gp_pct"],
-            r["units"], r["orders"]
-        ] for r in rs]
+        all_cat += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["category"],
+            round(r["gross_sales"],2),r["pct_gs"],r["cum_gs_pct"],
+            round(r["net_sales"],2),r["pct_revenue"],r["cum_pct"],
+            round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],r["pct_gp"],r["cum_gp_pct"],
+            r["units"],r["orders"]] for r in rs]
 
-        # Channels
         raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
                  "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-        all_ch += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"], r["channel"],
-            round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
-            r["pct_revenue"], r["cum_pct"], r["units"], r["orders"]
-        ] for r in rs]
+        all_ch += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["channel"],
+            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
+            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
 
-        # Customers
         raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-        all_cust += [[
-            now_str, pk, str(start), str(end),
-            r["rank"], r["pareto_zone"],
-            r["customer_id"], r["name"], r["email"], r["segment"],
-            round(r["net_sales"],2), r["pct_revenue"], r["cum_pct"],
-            r["orders"], r["units"], r["first_order"], r["last_order"]
-        ] for r in rs]
+        all_cust += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
+            r["customer_id"],r["name"],r["email"],r["segment"],round(r["net_sales"],2),
+            r["pct_revenue"],r["cum_pct"],r["orders"],r["units"],r["first_order"],r["last_order"]] for r in rs]
 
-        # New vs Returning
-        tc = sum(v["count"] for v in nvr.values()) or 1
-        tr = sum(v["net_sales"] for v in nvr.values()) or 1
+        tc = sum(v["count"] for v in nvr.values()) or 1; tr = sum(v["net_sales"] for v in nvr.values()) or 1
         for seg, v in nvr.items():
-            all_nvr.append([
-                now_str, pk, str(start), str(end), seg.capitalize(),
-                v["count"], round(v["net_sales"],2), v["orders"],
-                round(v["count"]/tc*100,1), round(v["net_sales"]/tr*100,1)
-            ])
+            all_nvr.append([now_str,pk,str(start),str(end),seg.capitalize(),
+                v["count"],round(v["net_sales"],2),v["orders"],
+                round(v["count"]/tc*100,1),round(v["net_sales"]/tr*100,1)])
 
         za_count = sum(1 for r in rs if r["pareto_zone"]=="A")
         print(f"  → {len(orders)} orders | Zone A: {za_count} products (GP-based) | "
@@ -1022,11 +712,7 @@ def main():
     upsert_tab(sh, "pareto_new_vs_ret", h_nvr,  all_nvr,  ["period","segment"])
 
     print(f"\n{'='*60}")
-    print(f"  ✓ Done v1.5 — {len(periods)} periods | Sheet: {SHEET_ID}")
-    print(f"  Categories: 7 Shopify order tags (Horse_Health, Grooming_Tools,")
-    print(f"              Horsewear, Supplements, Tack_Equipment,")
-    print(f"              StableSupplies_Collection, Rider)")
-    print(f"  Sorted and zoned by Gross Profit (cumulative)")
+    print(f"  ✓ Done v1.5.1 — {len(periods)} periods | Sheet: {SHEET_ID}")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
