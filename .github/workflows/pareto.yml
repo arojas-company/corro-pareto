@@ -1,26 +1,17 @@
 # .github/workflows/deploy.yml
-# Fix: Node.js 20 deprecation — use Node.js 24 explicitly
-# actions/checkout@v4 and actions/upload-artifact@v4 run on Node.js 20 by default.
-# Setting FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true opts into Node.js 24 now,
-# before GitHub forces it on June 2, 2026.
-
 name: Build and Deploy
-
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-# ✅ Fix: force Node.js 24 for all actions to eliminate deprecation warnings
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
     steps:
-      # actions/checkout@v4 — runs on Node.js 24 thanks to env var above
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -30,40 +21,38 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install requests gspread google-auth pytz
+        run: pip install requests gspread google-auth pytz
 
       - name: Run Pareto Pipeline
         env:
           SHOPIFY_TOKEN_CORRO: ${{ secrets.SHOPIFY_TOKEN_CORRO }}
-          GOOGLE_CREDENTIALS:  ${{ secrets.GOOGLE_CREDENTIALS }}
+          GOOGLE_CREDENTIALS:  ${{ secrets.GOOGLE_CREDENTIALS }}   # ← fixed
           SHEET_ID_CORRO:      ${{ secrets.SHEET_ID_CORRO }}
         run: python pareto_v1.py
 
-      # actions/upload-artifact@v4 — also runs on Node.js 24 thanks to env var
       - name: Upload artifact (if any)
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: pareto-output
-          path: |
-            *.log
+          path: "*.log"
           retention-days: 7
 
-  # GitHub Pages deploy job (if you deploy the HTML dashboard)
   deploy-pages:
     runs-on: ubuntu-latest
     needs: build-and-deploy
     if: github.ref == 'refs/heads/main'
+    # ✅ Fix: required for GitHub Pages deployments
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     permissions:
       contents: read
       pages: write
       id-token: write
-    # Only one concurrent deployment at a time
     concurrency:
       group: pages
       cancel-in-progress: false
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
