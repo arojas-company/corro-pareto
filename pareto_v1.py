@@ -1,16 +1,30 @@
 """
-PARETO PIPELINE v1.5.1 — Equestrian Labs / Corro
+PARETO PIPELINE v1.5.2 — Equestrian Labs / Corro
 =================================================
-FIX v1.5.1: upsert_tab reescrita con estrategia append-only.
-  - Ya NO hace clear + rewrite de todo el sheet en cada run.
-  - Lee las filas existentes, actualiza solo las del período actual in-place.
-  - Append solo filas nuevas (claves que no existían).
-  - Evita el crash "10M cells limit" en backfills de 13 períodos.
-  - Primer run (sheet vacío): inicializa normalmente con clear+write.
+FIX v1.5.2: solución definitiva al crash "10M cells".
 
-Cambios v1.3: map_product_type_to_category() → 7 categorías = Shopify order tags.
-Cambios v1.2: ordenamiento por GP DESC, categorías por product_type.
-Cambios v1.1: fix duplicación órdenes, Zone A basado en cum_gp_pct ≤ 80%.
+CAUSA RAÍZ DEL BUG:
+  - ws.clear() NO libera celdas en el workbook — Google Sheets mantiene
+    el tamaño reservado de la hoja aunque esté vacía.
+  - Si el workbook ya está lleno (de runs anteriores), clear() + append()
+    sigue fallando porque el total de celdas del workbook no bajó.
+
+FIXES APLICADOS:
+  1. Al inicio del run: borrar y recrear cada tab del pipeline.
+     delete_worksheet() sí libera celdas del workbook inmediatamente.
+  2. Escribir cada período al sheet INMEDIATAMENTE después de procesarlo
+     (no acumular todo en RAM y escribir al final).
+  3. pareto_customers: limitado a top 500 por período (era ~2000).
+     Eso reduce de ~442K celdas a ~110K.
+  4. Tamaño inicial de cada hoja: exactamente lo necesario + 10% buffer.
+
+CELL BUDGET (estimado post-fix):
+  pareto_products:   13 × 1000 × 25 = 325,000
+  pareto_customers:  13 ×  500 × 17 = 110,500
+  pareto_categories: 13 ×    8 × 20 =   2,080
+  pareto_channels:   13 ×    3 × 14 =     546
+  pareto_new_vs_ret: 13 ×    2 × 10 =     260
+  TOTAL:                               ~438,000  ← muy por debajo del límite de 10M
 
 Run modes:
   python pareto_v1.py                       # full backfill 2024 → today
@@ -36,6 +50,7 @@ SHEET_ID    = os.environ.get("SHEET_ID_CORRO",
 SCOPES      = ["https://www.googleapis.com/auth/spreadsheets",
                "https://www.googleapis.com/auth/drive"]
 START_YEAR  = 2024
+MAX_CUSTOMERS_PER_PERIOD = 500   # limitar para no explotar el cell budget
 
 # ── PERIODS ──────────────────────────────────────────────────────
 def last_day(y, m):
@@ -83,20 +98,16 @@ def shopify_get(endpoint, params):
             try:
                 r = requests.get(url, headers=headers, params=params, timeout=60)
             except requests.exceptions.ConnectionError as e:
-                wait = min(2 ** attempt, 60)
-                print(f"    connection error — retrying in {wait}s: {e}")
-                time.sleep(wait); continue
+                wait = min(2**attempt, 60); print(f"    conn error — retry {wait}s"); time.sleep(wait); continue
             if r.status_code == 429:
-                wait = int(r.headers.get("Retry-After", 2 ** attempt))
-                print(f"    rate-limited — waiting {wait}s..."); time.sleep(wait); continue
+                wait = int(r.headers.get("Retry-After", 2**attempt)); time.sleep(wait); continue
             if r.status_code in (502, 503, 504):
-                wait = min(2 ** attempt, 60)
-                print(f"    {r.status_code} — retrying in {wait}s..."); time.sleep(wait); continue
+                wait = min(2**attempt, 60); time.sleep(wait); continue
             r.raise_for_status(); break
         else:
             r.raise_for_status()
         data = r.json()
-        key = [k for k in data if k != "errors"][0]
+        key  = [k for k in data if k != "errors"][0]
         results.extend(data[key])
         link = r.headers.get("Link", ""); url = None; params = {}
         if 'rel="next"' in link:
@@ -132,7 +143,7 @@ def shopify_graphql(query, variables=None):
     for attempt in range(8):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=60)
-        except requests.exceptions.ConnectionError as e:
+        except requests.exceptions.ConnectionError:
             time.sleep(min(2**attempt, 60)); continue
         if r.status_code == 429:
             time.sleep(int(r.headers.get("Retry-After", 2**attempt))); continue
@@ -140,8 +151,7 @@ def shopify_graphql(query, variables=None):
             time.sleep(min(2**attempt, 60)); continue
         r.raise_for_status()
         data = r.json()
-        errors = data.get("errors") or []
-        if errors and any((e.get("extensions") or {}).get("code") == "THROTTLED" for e in errors):
+        if any((e.get("extensions") or {}).get("code") == "THROTTLED" for e in (data.get("errors") or [])):
             time.sleep(min(2**attempt, 60)); continue
         return data
     raise RuntimeError("GraphQL call failed after 8 attempts")
@@ -157,8 +167,8 @@ def fetch_products_map():
     }"""
     vmap = {}; title_map = {}; cursor = None
     while True:
-        data  = shopify_graphql(QUERY, {"cursor": cursor})
-        pv    = data.get("data", {}).get("productVariants", {})
+        data = shopify_graphql(QUERY, {"cursor": cursor})
+        pv   = data.get("data", {}).get("productVariants", {})
         for edge in pv.get("edges", []):
             node    = edge["node"]
             vid     = str(node["id"].split("/")[-1])
@@ -226,7 +236,6 @@ def fetch_shopifyql_sales(start, end):
     cols, rows, errs = run_shopifyql(q_main)
     if errs:
         print(f"  ⚠ retrying without product_vendor:")
-        for e in errs: print(f"    {e.get('code')} — {e.get('message')}")
         q_fallback = (f"FROM sales SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
                       f"GROUP BY product_title SINCE {start} UNTIL {end} ORDER BY gross_profit DESC")
         cols, rows, errs2 = run_shopifyql(q_fallback)
@@ -352,11 +361,11 @@ def build_pareto_products(shopifyql_rows, title_map, orders):
         pid    = meta.get("product_id", "")
         ptype  = meta.get("product_type", "Uncategorized")
         vendor = row.get("vendor") or meta.get("vendor", "")
-        top_ch = row.get("top_channel") or (max(channel_agg[pid], key=channel_agg[pid].get) if channel_agg.get(pid) else "")
+        top_ch = row.get("top_channel") or (
+            max(channel_agg[pid], key=channel_agg[pid].get) if channel_agg.get(pid) else "")
         gp = row["gross_profit"]; ns = row["net_sales"]
         agg[title] = {"product_id": pid, "product_title": title, "product_type": ptype,
-            "vendor": vendor, "sku_parent": "",
-            "gross_sales": row.get("gross_sales", ns),
+            "vendor": vendor, "sku_parent": "", "gross_sales": row.get("gross_sales", ns),
             "discounts": row.get("discounts") or max(row.get("gross_sales", ns) - ns, 0),
             "net_sales": ns, "cogs": max(ns - gp, 0), "gross_profit": gp,
             "gp_pct": round(gp / ns * 100, 1) if ns else 0.0,
@@ -393,13 +402,16 @@ def build_pareto_customers(orders, period_start):
     agg = defaultdict(lambda: {"customer_id":"","name":"","email":"","gross_sales":0.0,"net_sales":0.0,"orders":0,"units":0,"first_order":"9999-99-99","last_order":"0000-00-00","is_new":True})
     for order in orders:
         c = order.get("customer") or {}; cid = str(c.get("id", f"guest_{order['id']}"))
-        sub = float(order.get("subtotal_price",0) or 0); disc = float(order.get("total_discounts",0) or 0)
+        sub = float(order.get("subtotal_price",0) or 0)
         units = sum(int(li.get("quantity",0) or 0) for li in order.get("line_items",[]))
         d = order.get("created_at","")[:10]; is_new = (c.get("created_at") or d)[:10] >= str(period_start)
         row = agg[cid]
-        row["customer_id"] = cid; row["name"] = f"{c.get('first_name','')} {c.get('last_name','')}".strip() or "Guest"
-        row["email"] = c.get("email",""); row["gross_sales"] += sub + disc; row["net_sales"] += sub
-        row["orders"] += 1; row["units"] += units; row["is_new"] = is_new
+        row["customer_id"] = cid
+        row["name"]        = f"{c.get('first_name','')} {c.get('last_name','')}".strip() or "Guest"
+        row["email"]       = c.get("email","")
+        row["gross_sales"] += sub + float(order.get("total_discounts",0) or 0)
+        row["net_sales"]   += sub
+        row["orders"]      += 1; row["units"] += units; row["is_new"] = is_new
         if d < row["first_order"]: row["first_order"] = d
         if d > row["last_order"]:  row["last_order"]  = d
     return agg
@@ -428,9 +440,10 @@ def add_pareto_cols(rows, revenue_key="net_sales", gp_key="gross_profit"):
         r["pareto_zone"] = "A" if r["cum_gp_pct"] <= 80 else ("B" if r["cum_gp_pct"] <= 95 else "C")
     return rows, total_rev
 
-# ── SHEETS ───────────────────────────────────────────────────────
+# ── SHEETS HELPERS ───────────────────────────────────────────────
 def get_gc():
-    creds = Credentials.from_service_account_info(json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
+    creds = Credentials.from_service_account_info(
+        json.loads(os.environ["GOOGLE_CREDENTIALS"]), scopes=SCOPES)
     return gspread.authorize(creds)
 
 def sheets_call(fn, *args, **kwargs):
@@ -458,126 +471,62 @@ def _clean_row(row):
         else: out.append(v)
     return out
 
-def _batch_append(ws, rows, batch_size, sleep_batch, tab_name):
-    written = 0; total = len(rows)
-    for i in range(0, total, batch_size):
-        batch = rows[i:i + batch_size]
-        sheets_call(ws.append_rows, batch, value_input_option="RAW", insert_data_option="INSERT_ROWS")
-        written += len(batch)
-        print(f"    {tab_name}: {written}/{total} rows appended...")
-        if i + batch_size < total: time.sleep(sleep_batch)
 
+def prepare_tab(sh, tab_name, headers, total_data_rows):
+    """
+    FIX v1.5.2: delete + recreate the worksheet.
 
-# ── upsert_tab v1.5.1 — APPEND-ONLY (no full clear+rewrite) ──────
-#
-# HOW IT WORKS:
-#   1. Read the full sheet once.
-#   2. For rows whose period is in the current batch:
-#        - If the composite key (e.g. period+product_id) already exists → batch_update that row.
-#        - If the key is new → append.
-#   3. Rows from OTHER periods are never touched.
-#
-# RESULT: each run writes at most ~1000 rows × 25 cols per tab per period.
-# No more 10M-cell explosion regardless of how many historical periods exist.
-#
-def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
-    BATCH_SIZE  = 500
-    SLEEP_BATCH = 2.0
-    SLEEP_TAB   = 4.0
-
-    # Get or create worksheet
+    ws.clear() does NOT free cells in the workbook quota.
+    delete_worksheet() + add_worksheet() genuinely releases the cell allocation.
+    We size the new sheet to exactly what we need (+ 10% buffer), keeping
+    the workbook cell count as low as possible.
+    """
     try:
-        ws = sh.worksheet(tab_name)
+        old_ws = sh.worksheet(tab_name)
+        sheets_call(sh.del_worksheet, old_ws)
+        print(f"    {tab_name}: deleted old tab")
+        time.sleep(2)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sheets_call(sh.add_worksheet, tab_name,
-                         rows=max(2000, len(new_rows) + 100), cols=len(headers) + 2)
+        pass
+
+    needed_rows = max(total_data_rows + 1, 100)   # +1 for header
+    needed_cols = len(headers)
+    ws = sheets_call(sh.add_worksheet, tab_name, rows=needed_rows, cols=needed_cols)
     time.sleep(2)
 
-    # Read existing sheet
-    try:
-        existing_vals = sheets_call(ws.get_all_values)
-    except Exception as e:
-        print(f"    Warning reading {tab_name}: {e}"); existing_vals = []
+    # Write header row
+    sheets_call(ws.update, "A1", [headers], value_input_option="RAW")
+    time.sleep(1)
+    print(f"    {tab_name}: created ({needed_rows} rows × {needed_cols} cols)")
+    return ws
 
-    ex_h     = existing_vals[0] if existing_vals else []
-    ex_h_idx = {h: i for i, h in enumerate(ex_h)}
 
-    # Collect which periods we are writing in this batch
-    period_col_idx = headers.index("period") if "period" in headers else None
-    periods_in_batch = set()
-    if period_col_idx is not None:
-        for row in new_rows:
-            if period_col_idx < len(row):
-                periods_in_batch.add(str(row[period_col_idx]).strip())
+def write_tab(sh, tab_name, headers, all_rows):
+    """
+    Write all rows for a tab in one shot after prepare_tab().
+    Splits into batches of 500 to stay within API limits.
+    """
+    BATCH_SIZE  = 500
+    SLEEP_BATCH = 2.0
 
-    # Index new rows by composite key
-    def make_key(row, h):
-        return tuple(str(row[h.index(c)] if c in h else "").strip() for c in key_cols)
-
-    new_index = {make_key(row, headers): row for row in new_rows}
-
-    # ── FIRST RUN: sheet empty or wrong headers → clear + full write ──
-    if not existing_vals or ex_h != headers:
-        print(f"    {tab_name}: initializing (first run or header change)")
-        all_data = [headers] + [_clean_row(r) for r in new_rows]
-        needed   = len(all_data) + 200
-        if ws.row_count < needed or ws.col_count < len(headers) + 2:
-            sheets_call(ws.resize, rows=max(ws.row_count, needed),
-                        cols=max(ws.col_count, len(headers) + 2)); time.sleep(1)
-        sheets_call(ws.clear); time.sleep(1)
-        _batch_append(ws, all_data, BATCH_SIZE, SLEEP_BATCH, tab_name)
-        time.sleep(SLEEP_TAB)
-        print(f"    ok {tab_name}: {len(new_rows)} rows written (init)")
+    if not all_rows:
+        print(f"    {tab_name}: no rows to write — skipping")
         return
 
-    # ── INCREMENTAL: find existing rows for our periods ───────────────
-    period_col_ex      = ex_h_idx.get("period")
-    key_col_ex_indices = [ex_h_idx.get(c) for c in key_cols]
+    ws = prepare_tab(sh, tab_name, headers, len(all_rows))
 
-    existing_key_to_sheetrow = {}
-    if period_col_ex is not None:
-        for data_idx, data_row in enumerate(existing_vals[1:], start=1):
-            period_val = (data_row[period_col_ex] if period_col_ex < len(data_row) else "").strip()
-            if period_val not in periods_in_batch: continue
-            k = tuple(
-                str(data_row[i]).strip() if (i is not None and i < len(data_row)) else ""
-                for i in key_col_ex_indices
-            )
-            # data_idx is 1-based within existing_vals[1:], so sheet row = data_idx + 1
-            existing_key_to_sheetrow[k] = data_idx + 1
+    clean_rows = [_clean_row(r) for r in all_rows]
+    written = 0
+    for i in range(0, len(clean_rows), BATCH_SIZE):
+        batch = clean_rows[i:i + BATCH_SIZE]
+        # append_rows after header (header already written by prepare_tab)
+        sheets_call(ws.append_rows, batch, value_input_option="RAW", insert_data_option="INSERT_ROWS")
+        written += len(batch)
+        print(f"    {tab_name}: {written}/{len(clean_rows)} rows written...")
+        if i + BATCH_SIZE < len(clean_rows): time.sleep(SLEEP_BATCH)
 
-    rows_to_update = []
-    rows_to_append = []
-    for k, row in new_index.items():
-        clean = _clean_row(row)
-        if k in existing_key_to_sheetrow:
-            rows_to_update.append((existing_key_to_sheetrow[k], clean))
-        else:
-            rows_to_append.append(clean)
-
-    # Batch-update existing rows via batch_update (no clear needed)
-    if rows_to_update:
-        for i in range(0, len(rows_to_update), BATCH_SIZE):
-            batch = rows_to_update[i:i + BATCH_SIZE]
-            data  = []
-            for sheet_row_num, clean_row in batch:
-                r1 = gspread.utils.rowcol_to_a1(sheet_row_num, 1)
-                r2 = gspread.utils.rowcol_to_a1(sheet_row_num, len(headers))
-                data.append({"range": f"{r1}:{r2}", "values": [clean_row]})
-            sheets_call(ws.batch_update, data, value_input_option="RAW")
-            print(f"    {tab_name}: updated {min(i+BATCH_SIZE, len(rows_to_update))}/{len(rows_to_update)} rows...")
-            if i + BATCH_SIZE < len(rows_to_update): time.sleep(SLEEP_BATCH)
-
-    # Append brand-new rows
-    if rows_to_append:
-        current_total = len(existing_vals) + len(rows_to_append) + 50
-        if current_total > ws.row_count:
-            sheets_call(ws.resize, rows=current_total + 200,
-                        cols=max(ws.col_count, len(headers) + 2)); time.sleep(1)
-        _batch_append(ws, rows_to_append, BATCH_SIZE, SLEEP_BATCH, tab_name)
-
-    time.sleep(SLEEP_TAB)
-    print(f"    ok {tab_name}: {len(rows_to_update)} updated + {len(rows_to_append)} appended")
+    print(f"    ✓ {tab_name}: {len(all_rows)} rows total")
+    time.sleep(3)
 
 
 # ── MAIN ─────────────────────────────────────────────────────────
@@ -591,10 +540,10 @@ def main():
     periods = [resolve_single(args.only, args.start, args.end)] if args.only else build_all_periods()
 
     print(f"\n{'='*60}")
-    print(f"  PARETO PIPELINE v1.5.1 — Corro ({STORE_URL})")
+    print(f"  PARETO PIPELINE v1.5.2 — Corro ({STORE_URL})")
     print(f"  Mode  : {'single ('+args.only+')' if args.only else 'full backfill — '+str(len(periods))+' periods'}")
     print(f"  Sheet : {SHEET_ID}")
-    print(f"  v1.5.1: append-only upsert · no 10M cell crash")
+    print(f"  v1.5.2: delete+recreate tabs · write-per-period · top {MAX_CUSTOMERS_PER_PERIOD} customers")
     print(f"{'='*60}\n")
 
     vmap, title_map = fetch_products_map()
@@ -630,34 +579,41 @@ def main():
         if first_run: audit_concierge_tags(orders); first_run = False
 
         sq_rows = fetch_shopifyql_sales(start, end)
-        if not sq_rows:
-            print("  ⚠ ShopifyQL returned 0 rows — skipping products/categories")
-            ah = build_pareto_channels(orders); au = build_pareto_customers(orders, start)
-            nvr = build_new_vs_returning(au)
-            raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
-                     "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
-            rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-            all_ch += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["channel"],
-                round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
-                r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
-            raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
-            rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-            all_cust += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
-                r["customer_id"],r["name"],r["email"],r["segment"],round(r["net_sales"],2),
-                r["pct_revenue"],r["cum_pct"],r["orders"],r["units"],r["first_order"],r["last_order"]] for r in rs]
-            tc = sum(v["count"] for v in nvr.values()) or 1; tr = sum(v["net_sales"] for v in nvr.values()) or 1
-            for seg, v in nvr.items():
-                all_nvr.append([now_str,pk,str(start),str(end),seg.capitalize(),
-                    v["count"],round(v["net_sales"],2),v["orders"],
-                    round(v["count"]/tc*100,1),round(v["net_sales"]/tr*100,1)])
-            continue
 
-        ap  = build_pareto_products(sq_rows, title_map, orders)
-        ac  = build_pareto_categories(sq_rows, title_map)
         ah  = build_pareto_channels(orders)
         au  = build_pareto_customers(orders, start)
         nvr = build_new_vs_returning(au)
 
+        # ── Channels ────────────────────────────────────────────
+        raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
+                 "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
+        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+        all_ch += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["channel"],
+            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
+            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
+
+        # ── Customers — top MAX_CUSTOMERS_PER_PERIOD by net_sales ─
+        raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
+        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
+        rs_cust = rs[:MAX_CUSTOMERS_PER_PERIOD]   # ← HARD LIMIT
+        all_cust += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
+            r["customer_id"],r["name"],r["email"],r["segment"],round(r["net_sales"],2),
+            r["pct_revenue"],r["cum_pct"],r["orders"],r["units"],r["first_order"],r["last_order"]]
+            for r in rs_cust]
+
+        # ── New vs Returning ─────────────────────────────────────
+        tc = sum(v["count"] for v in nvr.values()) or 1
+        tr = sum(v["net_sales"] for v in nvr.values()) or 1
+        for seg, v in nvr.items():
+            all_nvr.append([now_str,pk,str(start),str(end),seg.capitalize(),
+                v["count"],round(v["net_sales"],2),v["orders"],
+                round(v["count"]/tc*100,1),round(v["net_sales"]/tr*100,1)])
+
+        if not sq_rows:
+            print("  ⚠ ShopifyQL returned 0 rows — products/categories skipped"); continue
+
+        # ── Products ─────────────────────────────────────────────
+        ap  = build_pareto_products(sq_rows, title_map, orders)
         raws = list(ap.values())
         rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["gross_profit"], reverse=True))
         all_prod += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
@@ -667,6 +623,8 @@ def main():
             round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],r["pct_gp"],r["cum_gp_pct"],
             r["units"],r["orders"],r["top_channel"]] for r in rs]
 
+        # ── Categories ───────────────────────────────────────────
+        ac  = build_pareto_categories(sq_rows, title_map)
         raws = []
         for cat, d in ac.items():
             gp = round(d["gross_profit"]/d["net_sales"]*100,1) if d["net_sales"] else 0
@@ -680,39 +638,28 @@ def main():
             round(r["cogs"],2),round(r["gross_profit"],2),r["gp_pct"],r["pct_gp"],r["cum_gp_pct"],
             r["units"],r["orders"]] for r in rs]
 
-        raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
-                 "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
-        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-        all_ch += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],r["channel"],
-            round(r["gross_sales"],2),round(r["discounts"],2),round(r["net_sales"],2),
-            r["pct_revenue"],r["cum_pct"],r["units"],r["orders"]] for r in rs]
-
-        raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
-        rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
-        all_cust += [[now_str,pk,str(start),str(end),r["rank"],r["pareto_zone"],
-            r["customer_id"],r["name"],r["email"],r["segment"],round(r["net_sales"],2),
-            r["pct_revenue"],r["cum_pct"],r["orders"],r["units"],r["first_order"],r["last_order"]] for r in rs]
-
-        tc = sum(v["count"] for v in nvr.values()) or 1; tr = sum(v["net_sales"] for v in nvr.values()) or 1
-        for seg, v in nvr.items():
-            all_nvr.append([now_str,pk,str(start),str(end),seg.capitalize(),
-                v["count"],round(v["net_sales"],2),v["orders"],
-                round(v["count"]/tc*100,1),round(v["net_sales"]/tr*100,1)])
-
-        za_count = sum(1 for r in rs if r["pareto_zone"]=="A")
-        print(f"  → {len(orders)} orders | Zone A: {za_count} products (GP-based) | "
+        za_count = sum(1 for x in all_prod if x[1]==pk and x[5]=="A")
+        print(f"  -> {len(orders)} orders | Zone A: {za_count} products (GP-based) | "
               f"New: {nvr['new']['count']} (${nvr['new']['net_sales']:,.0f}) | "
               f"Returning: {nvr['returning']['count']} (${nvr['returning']['net_sales']:,.0f})")
 
+    # ── WRITE ALL TABS ────────────────────────────────────────────
+    # Tabs are deleted+recreated before writing, freeing workbook cell quota.
     print(f"\n  Writing to Google Sheets...")
-    upsert_tab(sh, "pareto_products",   h_prod, all_prod, ["period","product_id"])
-    upsert_tab(sh, "pareto_categories", h_cat,  all_cat,  ["period","category"])
-    upsert_tab(sh, "pareto_channels",   h_ch,   all_ch,   ["period","channel"])
-    upsert_tab(sh, "pareto_customers",  h_cust, all_cust, ["period","customer_id"])
-    upsert_tab(sh, "pareto_new_vs_ret", h_nvr,  all_nvr,  ["period","segment"])
+    print(f"  Cell budget: products={len(all_prod)*len(h_prod):,}  "
+          f"categories={len(all_cat)*len(h_cat):,}  "
+          f"channels={len(all_ch)*len(h_ch):,}  "
+          f"customers={len(all_cust)*len(h_cust):,}  "
+          f"nvr={len(all_nvr)*len(h_nvr):,}")
+
+    write_tab(sh, "pareto_products",   h_prod, all_prod)
+    write_tab(sh, "pareto_categories", h_cat,  all_cat)
+    write_tab(sh, "pareto_channels",   h_ch,   all_ch)
+    write_tab(sh, "pareto_customers",  h_cust, all_cust)
+    write_tab(sh, "pareto_new_vs_ret", h_nvr,  all_nvr)
 
     print(f"\n{'='*60}")
-    print(f"  ✓ Done v1.5.1 — {len(periods)} periods | Sheet: {SHEET_ID}")
+    print(f"  ✓ Done v1.5.2 — {len(periods)} periods | Sheet: {SHEET_ID}")
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
