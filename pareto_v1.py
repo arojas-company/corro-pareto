@@ -1,5 +1,5 @@
 """
-PARETO PIPELINE v1.3 — Equestrian Labs / Corro
+PARETO PIPELINE v1.5 — Equestrian Labs / Corro
 ===============================================
 Cambios v1.3 vs v1.2:
 - CHANGED: map_product_type_to_category() ahora usa las 7 categorías que
@@ -34,6 +34,12 @@ Cambios v1.1 vs v1.0:
   y pareto_categories.
 - ADDED: columna cum_gs_pct (acumulado de Gross Sales %) — el frontend
   necesita ambos acumulados.
+
+FIX upsert_tab (crash ValueError: invalid literal for int() with base 10: 'rank'):
+- FIX 1: al leer existing rows del sheet, se saltan filas fantasma donde el
+  valor del key column sea igual al nombre de la columna (header escrito como dato).
+- FIX 2: sort_key es robusto ante valores no numéricos en la columna rank —
+  usa try/except en lugar de int() directo.
 
 Run modes:
   python pareto_v1.py                     # all periods 2024 → today
@@ -364,8 +370,6 @@ def fetch_shopifyql_sales(start, end):
         return cols, rows, errs
 
     # ── Query 1: product financials ───────────────────────────────────
-    # GROUP BY product_title, product_vendor (no GROUP_TOTALS — simpler, no parse errors)
-    # ORDER BY gross_profit DESC — straightforward, matches Shopify AI guidance
     q_main = (
         f"FROM sales "
         f"SHOW gross_profit, gross_sales, net_sales, orders, net_items_sold "
@@ -437,8 +441,7 @@ def fetch_shopifyql_sales(start, end):
         vendor = (row.get("product_vendor") or "").strip()
         if not title:
             continue
-        # Deduplicate: if product_title appears multiple times (can happen when
-        # product has variants from multiple vendors), aggregate into one row
+        # Deduplicate: if product_title appears multiple times aggregate into one row
         if title in seen:
             for r in results:
                 if r["product_title"] == title:
@@ -521,27 +524,11 @@ def map_product_type_to_category(raw_type):
     """
     v1.3: Maps Shopify product_type values to the 7 categories that match
     exactly the Shopify order tags assigned automatically to orders.
-
-    Order tag → category meaning:
-      Horse_Health           → Farmacia equina, terapéuticos (GastroGard, UlcerGard, Back on Track)
-      Grooming_Tools         → Herramientas de grooming (cajas, cepillos, detanglers)
-      Horsewear              → Ropa para caballos (mantas, sheets, fly wraps, coolers, neck covers)
-      Supplements            → Suplementos nutricionales (Cavalor, Nupafeed, Kentucky Performance, EO-3)
-      Tack_Equipment         → Equipo de tack (riendas, cinchas, breastplates, estribos, bridones)
-      StableSupplies_Collection → Suministros de establo (stall mats, bags, limpieza)
-      Rider                  → Productos para el jinete (ropa, shirts, breeches, boot bags, accesorios)
-
-    Keywords confirmed against Shopify product_type export (April 2026, 3,021 products).
-    Order matters — checked top to bottom, first match wins.
-    Dogs products map into Horse_Health (therapeutic) or Supplements per their product_type.
     """
     if not raw_type:
         return "Uncategorized"
     t = raw_type.strip().lower()
 
-    # ── Rider — jinete products checked FIRST ─────────────────────
-    # Must be before Tack_Equipment because "breeches" could otherwise
-    # fall through to accessories-related keywords.
     rider_kw = [
         "apparel", "breeches", "hat", "shirt", "schooling",
         "leather handbag", "handbag", "boot bag",
@@ -550,7 +537,6 @@ def map_product_type_to_category(raw_type):
     if any(k in t for k in rider_kw):
         return "Rider"
 
-    # ── Tack & Equipment ─────────────────────────────────────────
     tack_kw = [
         "bridle", "rein", "bridle accessories",
         "saddle pad", "all purpose", "hunter/jumper", "dressage saddle",
@@ -560,7 +546,6 @@ def map_product_type_to_category(raw_type):
     if any(k in t for k in tack_kw):
         return "Tack_Equipment"
 
-    # ── Horsewear — mantas, sheets, fly wraps, coolers ───────────
     horsewear_kw = [
         "blanket", "sheet", "fly wrap", "fly rug", "cooler",
         "neck cover", "hood", "turnout", "stable rug",
@@ -569,7 +554,6 @@ def map_product_type_to_category(raw_type):
     if any(k in t for k in horsewear_kw):
         return "Horsewear"
 
-    # ── Grooming Tools ───────────────────────────────────────────
     grooming_kw = [
         "detangler", "shampoo", "grooming", "brush", "comb",
         "body brace", "skin & hair", "fungal", "spray",
@@ -577,7 +561,6 @@ def map_product_type_to_category(raw_type):
     if any(k in t for k in grooming_kw):
         return "Grooming_Tools"
 
-    # ── Supplements — nutricionales ──────────────────────────────
     supplement_kw = [
         "supplement", "electrolyte", "vitamin", "probiotic",
         "omega", "joint", "performance",
@@ -585,19 +568,16 @@ def map_product_type_to_category(raw_type):
     if any(k in t for k in supplement_kw):
         return "Supplements"
 
-    # ── Horse Health — farmacia y terapéuticos ───────────────────
-    # Includes dog therapeutic/pharma products too
     health_kw = [
         "hoof care", "poultice", "liniment", "relief",
         "wound", "ointment", "pharmaceutical", "therapeutic",
         "ulcer", "gastric", "back on track",
-        "dog",  # dog products map here if not supplement
+        "dog",
         "personal care",
     ]
     if any(k in t for k in health_kw):
         return "Horse_Health"
 
-    # ── Stable Supplies ──────────────────────────────────────────
     stable_kw = [
         "stall mat", "stall & trailer", "trailer cleaning",
         "stall", "stable supply", "cleaning", "bag",
@@ -607,8 +587,6 @@ def map_product_type_to_category(raw_type):
     if any(k in t for k in stable_kw):
         return "StableSupplies_Collection"
 
-    # ── Rider catch-all: accessories ────────────────────────────
-    # 'accessories' is checked late to avoid false positives
     if "accessories" in t:
         return "Rider"
 
@@ -618,21 +596,10 @@ def map_product_type_to_category(raw_type):
 # ── AGGREGATION ─────────────────────────────────────────────────────
 def build_pareto_products(shopifyql_rows, title_map, orders):
     """
-    v1.5: All financials (gross_profit, gross_sales, net_sales, orders, units,
-    vendor, top_channel) come directly from ShopifyQL — exact match to
-    Shopify Analytics.
-
-    product_type comes from title_map (product catalogue via GraphQL) since
-    ShopifyQL FROM sales does not expose product_type.
-    top_channel comes from ShopifyQL channel query if available, otherwise
-    falls back to order-level detection.
-
-    shopifyql_rows: list of dicts from fetch_shopifyql_sales()
-    title_map:      dict[product_title.lower()] → {product_id, product_type, vendor}
-    orders:         raw order list — fallback for top_channel if ShopifyQL channel
-                    query was unavailable
+    v1.5: All financials come directly from ShopifyQL.
+    product_type comes from title_map (GraphQL catalogue).
+    top_channel from ShopifyQL channel query or fallback to order-level detection.
     """
-    # Fallback channel map from orders — only used if ShopifyQL channel query failed
     channel_agg = defaultdict(lambda: defaultdict(float))
     for order in orders:
         ch = detect_channel(order)
@@ -652,11 +619,7 @@ def build_pareto_products(shopifyql_rows, title_map, orders):
         meta   = title_map.get(title.lower(), {})
         pid    = meta.get("product_id", "")
         ptype  = meta.get("product_type", "Uncategorized")
-        # vendor: prefer ShopifyQL (comes from product_vendor in GROUP BY),
-        # fall back to title_map if blank
         vendor = row.get("vendor") or meta.get("vendor", "")
-        # top_channel: prefer ShopifyQL channel query result (already in row),
-        # fall back to order-level detection
         top_ch = row.get("top_channel") or (
             max(channel_agg[pid], key=channel_agg[pid].get)
             if channel_agg.get(pid) else ""
@@ -689,7 +652,6 @@ def build_pareto_products(shopifyql_rows, title_map, orders):
 def build_pareto_categories(shopifyql_rows, title_map):
     """
     v1.5: Aggregates ShopifyQL product rows into 7 order-tag categories.
-    gross_profit and all financials come from ShopifyQL — no COGS calculation.
     """
     agg = defaultdict(lambda: {
         "gross_sales": 0.0, "discounts": 0.0, "net_sales": 0.0,
@@ -833,19 +795,31 @@ def upsert_tab(sh, tab_name, headers, new_rows, key_cols):
             ex_h = vals[0]
             for r in vals[1:]:
                 m = {ex_h[i]: (r[i] if i < len(r) else "") for i in range(len(ex_h))}
-                k = tuple(str(m.get(c,"")).strip() for c in key_cols)
-                if any(k): existing[k] = [m.get(h,"") for h in headers]
+                # ✅ FIX 1: skip phantom header rows — value equals column name
+                if any(str(m.get(c, "")).strip() == c for c in key_cols):
+                    continue
+                k = tuple(str(m.get(c, "")).strip() for c in key_cols)
+                if any(k): existing[k] = [m.get(h, "") for h in headers]
     except Exception as e:
         print(f"    Warning reading {tab_name}: {e}")
 
     for row in new_rows:
         m = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-        k = tuple(str(m.get(c,"")).strip() for c in key_cols)
+        k = tuple(str(m.get(c, "")).strip() for c in key_cols)
         existing[k] = row
 
+    # ✅ FIX 2: sort_key robusto — nunca crashea con valores no numéricos en rank
     def sort_key(r):
         m = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
-        return (str(m.get("period_start","") or ""), str(m.get("period","") or ""), int(m.get("rank",0) or 0))
+        try:
+            rank_val = int(m.get("rank", 0) or 0)
+        except (ValueError, TypeError):
+            rank_val = 0
+        return (
+            str(m.get("period_start", "") or ""),
+            str(m.get("period", "")       or ""),
+            rank_val,
+        )
 
     merged = sorted(existing.values(), key=sort_key)
     all_data = [headers]
@@ -931,17 +905,13 @@ def main():
             audit_concierge_tags(orders)
             first_run = False
 
-        # ── ShopifyQL: gross_profit, gross_sales, net_sales, orders, units per product
-        #    Same source as Shopify Analytics — gross_profit matches exactly.
         sq_rows = fetch_shopifyql_sales(start, end)
         if not sq_rows:
             print("  ⚠ ShopifyQL returned 0 rows — skipping products/categories for this period")
             print("    Check that token has read_reports scope.")
-            # Skip products + categories but still write channels, customers, nvr
             ah  = build_pareto_channels(orders)
             au  = build_pareto_customers(orders, start)
             nvr = build_new_vs_returning(au)
-            # channels
             raws = [{"channel":ch,"net_sales":d["net_sales"],"gross_sales":d["gross_sales"],
                      "discounts":d["discounts"],"units":d["units"],"orders":len(d["orders"])} for ch,d in ah.items()]
             rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
@@ -951,7 +921,6 @@ def main():
                 round(r["gross_sales"],2), round(r["discounts"],2), round(r["net_sales"],2),
                 r["pct_revenue"], r["cum_pct"], r["units"], r["orders"]
             ] for r in rs]
-            # customers
             raws = [dict(d, segment="New" if d["is_new"] else "Returning") for d in au.values()]
             rs, _ = add_pareto_cols(sorted(raws, key=lambda x: x["net_sales"], reverse=True))
             all_cust += [[
