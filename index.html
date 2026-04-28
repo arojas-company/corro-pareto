@@ -126,13 +126,15 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
 .chart-legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
 
 /* CHANNEL CARDS */
-.ch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px}
+.ch-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px}
 .chc{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:13px 15px}
 .chc-name{font-size:10px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}
 .chc-v{font-family:'Syne',sans-serif;font-size:20px;font-weight:700;letter-spacing:-.02em}
 .chc-sub{font-size:10px;color:var(--tx3);margin-top:2px}
 .chc-bar{height:3px;background:var(--bd2);border-radius:2px;margin-top:9px;overflow:hidden}
 .chc-barf{height:100%;border-radius:2px;transition:width .5s}
+/* GP row in channel card */
+.chc-gp{font-size:11px;font-weight:600;color:var(--A);margin-top:5px}
 
 /* SUMMARY SECTION */
 .sum-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:8px}
@@ -141,6 +143,12 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
 .sum-v{font-family:'Syne',sans-serif;font-size:18px;font-weight:700;letter-spacing:-.02em}
 .sum-sub{font-size:10px;color:var(--tx3);margin-top:3px}
 .sum-gp{font-size:11px;color:var(--A);margin-top:4px;font-weight:600}
+
+/* NVR — two-column layout with GP on right */
+.nvr-row{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+@media(max-width:640px){.nvr-row{grid-template-columns:1fr}}
+.nvr-card{background:var(--sf);border:.5px solid var(--bd);border-radius:10px;padding:14px 16px}
+.nvr-gp-badge{display:inline-flex;align-items:center;gap:4px;font-family:'DM Mono',monospace;font-size:10px;padding:2px 8px;border-radius:4px;background:var(--A-bg);color:var(--A);border:1px solid var(--A-bd);margin-top:6px}
 
 /* LOADING */
 .ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;
@@ -253,13 +261,13 @@ td.gp-sep{border-left:2px solid rgba(46,232,150,.2)}
     <div id="tbl-categories"><div class="empty">Select a period above</div></div>
   </div>
 
-  <!-- CHANNELS -->
-  <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">Summary by Sales Channel</div></div>
+  <!-- CHANNELS — ✅ UPDATED: now shows Gross Profit from product data -->
+  <div class="sec"><div class="sn">03</div><div class="sl"></div><div class="st">Summary by Sales Channel — Net Sales + Gross Profit</div></div>
   <div id="ch-summary"><div class="empty">Loading...</div></div>
   <div class="ch-grid" style="margin-top:8px" id="ch-grid"></div>
 
-  <!-- NEW VS RETURNING -->
-  <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">New vs Returning customers</div></div>
+  <!-- NEW VS RETURNING — ✅ UPDATED: added Gross Profit column -->
+  <div class="sec"><div class="sn">04</div><div class="sl"></div><div class="st">New vs Returning customers — Net Sales + Gross Profit</div></div>
   <div id="nvr-panel"></div>
 
   <!-- TOP CUSTOMERS -->
@@ -339,23 +347,6 @@ let catChartInst = null;
 const $ = id => document.getElementById(id);
 
 // ── CATEGORY TAXONOMY v1.3 ────────────────────────────────────────
-// Matches exactly the 7 Shopify order tags.
-// Order tags are auto-assigned to orders based on product_type of line items.
-//
-// Tag → meaning:
-//   Horse_Health           → Farmacia equina / terapéuticos (GastroGard, UlcerGard, Back on Track)
-//   Grooming_Tools         → Herramientas de grooming (cajas, cepillos, detanglers)
-//   Horsewear              → Ropa caballos (mantas, sheets, fly wraps, coolers, neck covers)
-//   Supplements            → Suplementos nutricionales (Cavalor, Nupafeed, Kentucky Performance, EO-3)
-//   Tack_Equipment         → Equipo tack (riendas, cinchas, breastplates, estribos, bridones)
-//   StableSupplies_Collection → Suministros establo (stall mats, bags, limpieza)
-//   Rider                  → Jinete (ropa, shirts, breeches, boot bags, accesorios)
-//
-// IMPORTANT — keyword order matters:
-//   "Rider" checked FIRST — 'breeches', 'shirt', etc. must not fall into Tack_Equipment.
-//   "accessories" checked LAST as Rider catch-all — avoids false matches on tack accessories.
-//   "dog" products → Horse_Health (therapeutic) or Supplements depending on product_type.
-
 const CAT_ORDER = [
   ["Rider",                    ["apparel","breeches","hat","shirt","schooling","leather handbag","handbag","boot bag","rider","belt"]],
   ["Tack_Equipment",           ["bridle","rein","bridle accessories","saddle pad","all purpose","hunter/jumper","dressage saddle","half pad","stirrup","dressage bridle","girth","breastplate","martingale","bit"]],
@@ -366,7 +357,6 @@ const CAT_ORDER = [
   ["StableSupplies_Collection",["stall mat","stall & trailer","trailer cleaning","stall","stable supply","cleaning","bag","cavali club","spring 2024","special edition","_elite_gift","elite_gift"]],
 ];
 
-// Colors for each order tag — consistent across chart, summary cards, table
 const CAT_COLORS = {
   "Tack_Equipment":              "#72AEFF",
   "Rider":                       "#2EE896",
@@ -378,7 +368,6 @@ const CAT_COLORS = {
   "Uncategorized":               "#72706A",
 };
 
-// Human-readable display labels (keep the tag name as-is for Sheets matching)
 const CAT_LABELS = {
   "Tack_Equipment":              "Tack & Equipment",
   "Rider":                       "Rider",
@@ -391,14 +380,11 @@ const CAT_LABELS = {
 };
 
 function getCategory(raw) {
-  // Maps Shopify product_type → one of the 7 order tag categories.
-  // Mirrors map_product_type_to_category() in pareto_v1.py exactly.
   if (!raw) return "Uncategorized";
   const t = raw.trim().toLowerCase();
   for (const [cat, kws] of CAT_ORDER) {
     if (kws.some(k => t.includes(k))) return cat;
   }
-  // Late catch-all: 'accessories' → Rider (after all other checks)
   if (t.includes("accessories")) return "Rider";
   return "Uncategorized";
 }
@@ -466,23 +452,18 @@ async function fetchTab(tab){
   }catch(e){console.error(tab,e);return[];}
 }
 
-// Sort by gross_profit DESC — canonical sort for products and categories
 function byPeriodGP(rows, pk){
   return rows
     .filter(r=>(r.period||"").trim()===pk)
     .sort((a,b)=>parseFloat(b.gross_profit||0)-parseFloat(a.gross_profit||0));
 }
-// Sort by net_sales DESC — used only for channels and customers (no GP field)
 function byPeriodNS(rows, pk){
   return rows
     .filter(r=>(r.period||"").trim()===pk)
     .sort((a,b)=>parseFloat(b.net_sales||0)-parseFloat(a.net_sales||0));
 }
 
-// ── BUILD CATEGORIES from product rows (using product_type field) ─
-// This aggregates every product in the period into the 7 order-tag categories.
-// Mirrors the Python build_pareto_categories() + map_product_type_to_category().
-// Result is sorted by gross_profit DESC to match Sheets data.
+// ── BUILD CATEGORIES from product rows ─────────────────────────────
 function buildCatsFromProducts(productRows){
   const groups = {};
   productRows.forEach(r => {
@@ -503,8 +484,38 @@ function buildCatsFromProducts(productRows){
   Object.values(groups).forEach(g => {
     g.gp_pct = g.net_sales > 0 ? ((g.gross_profit/g.net_sales)*100).toFixed(1) : "0.0";
   });
-  // Sort by GP DESC — matches Python pipeline
   return Object.values(groups).sort((a,b) => b.gross_profit - a.gross_profit);
+}
+
+// ── BUILD GP PER CHANNEL from product rows ─────────────────────────
+// Since pareto_channels tab doesn't have GP, we compute it from product rows
+// grouped by top_channel. This matches ShopifyQL-sourced GP data.
+function buildChannelGPFromProducts(productRows) {
+  const gpMap = {};
+  productRows.forEach(r => {
+    const ch = r.top_channel || "Online (Ecom)";
+    if (!gpMap[ch]) gpMap[ch] = { gross_profit: 0, net_sales: 0 };
+    gpMap[ch].gross_profit += parseFloat(r.gross_profit||0);
+    gpMap[ch].net_sales    += parseFloat(r.net_sales||0);
+  });
+  return gpMap;
+}
+
+// ── BUILD GP PER CUSTOMER SEGMENT from customer + product rows ──────
+// We approximate NVR GP using total GP margin applied to NVR net sales.
+// More accurate: aggregate GP from products by channel, then apply to NVR.
+function buildNVRWithGP(nvrRows, productRows) {
+  const totalNS = productRows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0) || 1;
+  const totalGP = productRows.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0) || 0;
+  const overallMargin = totalGP / totalNS; // overall GP margin rate
+
+  return nvrRows.map(r => ({
+    ...r,
+    // Estimated GP = segment net_sales × overall GP margin
+    // This is an approximation — exact NVR GP requires order-level product GP
+    est_gross_profit: parseFloat(r.net_sales||0) * overallMargin,
+    gp_margin_pct: (overallMargin * 100).toFixed(1),
+  }));
 }
 
 // ── SUMMARY KPIs ──────────────────────────────────────────────────
@@ -522,30 +533,24 @@ function renderSummary(fp){
   $("s-ord").textContent   = fmtN(totalOrd);
   $("s-prod").textContent  = fmtN(totalUnits);
   $("s-za").textContent    = za;
-  // fp is already sorted GP desc — fp[0] is the highest GP product
   $("s-top1").textContent  = fmtP(fp[0]?.pct_gp||0);
   $("s-top1-name").textContent = (fp[0]?.product_title||"").split(" ").slice(0,5).join(" ");
   $("s-upd").textContent   = (fp[0]?.updated_at||"").slice(0,10)||"—";
 }
 
-// ── PARETO BAR — uses GP share per zone ──────────────────────────
+// ── PARETO BAR ────────────────────────────────────────────────────
 function renderCumBar(fp){
   const bar=$("cum-bar");bar.innerHTML="";
   if(!fp.length)return;
-
-  // Recalculate GP per zone from actual data (don't rely on pct_revenue which is NS-based)
   const totalGP = fp.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0)||1;
   let cumGP = 0;
   const zGP = {A:0,B:0,C:0};
-
-  // Re-assign zones dynamically from sorted rows
   fp.forEach(r => {
     cumGP += parseFloat(r.gross_profit||0);
     const cumPct = (cumGP/totalGP)*100;
     const zone = cumPct <= 80 ? "A" : cumPct <= 95 ? "B" : "C";
     zGP[zone] += parseFloat(r.gross_profit||0);
   });
-
   [["A","var(--bar-a)"],["B","var(--bar-b)"],["C","var(--bar-c)"]].forEach(([zn,c])=>{
     const p = (zGP[zn]/totalGP)*100;
     if(p < 0.5) return;
@@ -606,7 +611,6 @@ function renderProducts(rows){
     const pctNS    = ((parseFloat(r.net_sales||0)/totalNS)*100).toFixed(1);
     const cumNSpct = ((cumNS/totalNS)*100).toFixed(1);
     const cumGPpct = ((cumGP/totalGP)*100).toFixed(1);
-    // Assign zone dynamically from recalculated cumulative GP
     const dynZone  = parseFloat(cumGPpct) <= 80 ? "A" : parseFloat(cumGPpct) <= 95 ? "B" : "C";
     const catName  = catLabel(getCategory(r.product_type||""));
     return `<tr>
@@ -630,7 +634,6 @@ function renderProducts(rows){
 // ── CATEGORY CHART ────────────────────────────────────────────────
 function renderCategoryChart(grouped){
   const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-  // Labels in display form, data sorted GP desc (already sorted in grouped)
   const labels  = grouped.map(g => catLabel(g.category));
   const gsData  = grouped.map(g => Math.round(g.gross_sales));
   const gpData  = grouped.map(g => Math.round(g.gross_profit));
@@ -660,7 +663,6 @@ function renderCategoryChart(grouped){
         {
           label: 'Gross Profit',
           data: gpData,
-          // Each bar gets the category's own color for GP
           backgroundColor: barColors,
           borderColor: borderColors,
           borderWidth: 1,
@@ -683,7 +685,6 @@ function renderCategoryChart(grouped){
         x: {
           ticks: { color: textColor, font: { size: 11 }, autoSkip: false,
             callback: function(val) {
-              // Shorten long labels for the axis
               const label = this.getLabelForValue(val);
               return label.length > 12 ? label.slice(0,11)+'…' : label;
             }
@@ -704,14 +705,11 @@ function renderCategoryChart(grouped){
 
 // ── CATEGORIES TABLE + SUMMARY ────────────────────────────────────
 function renderCategories(grouped){
-  // grouped is already sorted by GP desc from buildCatsFromProducts()
-
   renderCategoryChart(grouped);
 
   const totalNS = grouped.reduce((a,g)=>a+g.net_sales,0)||1;
   const totalGP = grouped.reduce((a,g)=>a+g.gross_profit,0)||1;
 
-  // Summary cards — one per category, sorted GP desc
   const sumEl = $("cat-summary");
   sumEl.innerHTML = `<div class="sum-grid">${grouped.map(g => {
     const pctNS = ((g.net_sales/totalNS)*100).toFixed(1);
@@ -725,7 +723,6 @@ function renderCategories(grouped){
     </div>`;
   }).join("")}</div>`;
 
-  // Table
   const el = $("tbl-categories");
   if(!grouped.length){ el.innerHTML=`<div class="empty">No data.</div>`; return; }
 
@@ -761,7 +758,8 @@ function renderCategories(grouped){
   }).join("")}</tbody></table>`;
 }
 
-// ── CHANNEL SUMMARY + CARDS ───────────────────────────────────────
+// ── CHANNEL SUMMARY + CARDS ─────────────────────────────────────────
+// ✅ UPDATED: now includes Gross Profit computed from product rows by top_channel
 const CH_COLORS = {
   "Wellington (POS)": "#D8B054",
   "Concierge":        "#A090FF",
@@ -769,7 +767,7 @@ const CH_COLORS = {
   "Others":           "#888",
 };
 
-function renderChannels(rows){
+function renderChannels(rows, channelGPMap){
   const sumEl = $("ch-summary");
   const el    = $("ch-grid"); el.innerHTML = "";
 
@@ -780,44 +778,88 @@ function renderChannels(rows){
   }
 
   const totalNS = rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
+  const totalGP = Object.values(channelGPMap).reduce((a,v)=>a+v.gross_profit,0)||1;
 
   sumEl.innerHTML = `<div class="sum-grid">${rows.map(r=>{
     const c    = CH_COLORS[r.channel] || "#888";
     const pctNS = ((parseFloat(r.net_sales||0)/totalNS)*100).toFixed(1);
+    const gpData = channelGPMap[r.channel] || {};
+    const gp    = gpData.gross_profit || 0;
+    const gpPct = gpData.net_sales > 0 ? ((gp/gpData.net_sales)*100).toFixed(1) : "—";
+    const pctGP = ((gp/totalGP)*100).toFixed(1);
     return `<div class="sum-card"><div class="sum-label" style="color:${c}">${r.channel}</div>
       <div class="sum-v" style="color:${c}">${fmt$(r.net_sales)}</div>
-      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(r.orders)} orders · ${fmtN(r.units)} units</div></div>`;
+      <div class="sum-sub">${pctNS}% of Net Sales · ${fmtN(r.orders)} orders · ${fmtN(r.units)} units</div>
+      <div class="sum-gp">GP: ${fmt$(gp)} · ${gpPct}% margin · ${pctGP}% of total GP</div></div>`;
   }).join("")}</div>`;
 
   rows.forEach(r => {
     const c = CH_COLORS[r.channel] || "#888";
+    const gpData = channelGPMap[r.channel] || {};
+    const gp    = gpData.gross_profit || 0;
+    const gpPct = gpData.net_sales > 0 ? ((gp/gpData.net_sales)*100).toFixed(1) : "—";
     const d = document.createElement("div"); d.className = "chc";
     d.innerHTML = `<div class="chc-name">${r.channel}</div>
       <div class="chc-v" style="color:${c}">${fmt$(r.net_sales)}</div>
       <div class="chc-sub">${fmtP(r.pct_revenue)} &nbsp;·&nbsp; ${fmtN(r.orders)} orders &nbsp;·&nbsp; ${fmtN(r.units)} units</div>
+      <div class="chc-gp">GP ${fmt$(gp)} <span style="font-size:10px;font-weight:400;color:var(--tx3)">${gpPct}% margin</span></div>
       <div class="chc-bar"><div class="chc-barf" style="width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${c}"></div></div>`;
     el.appendChild(d);
   });
 }
 
-// ── NEW VS RETURNING ──────────────────────────────────────────────
-function renderNVR(rows){
+// ── NEW VS RETURNING ─────────────────────────────────────────────────
+// ✅ UPDATED: shows Gross Profit alongside Net Sales (estimated from overall GP margin)
+function renderNVR(rows, productRows){
   const el = $("nvr-panel"); if(!el) return;
   if(!rows.length){
     el.innerHTML = `<div class="empty" style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px">No data. Run pipeline first.</div>`;
     return;
   }
-  el.innerHTML = `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px">${rows.map(r=>{
+
+  // Compute overall GP margin from products to estimate NVR GP
+  const totalProdNS = productRows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
+  const totalProdGP = productRows.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0)||0;
+  const overallMargin = totalProdGP / totalProdNS;
+
+  const totalNVR_NS = rows.reduce((a,r)=>a+parseFloat(r.net_sales||0),0)||1;
+  const totalNVR_GP = rows.reduce((a,r)=>a+parseFloat(r.net_sales||0)*overallMargin,0)||1;
+
+  el.innerHTML = `<div class="nvr-row">${rows.map(r=>{
     const isNew = (r.segment||"").toLowerCase()==="new";
     const clr   = isNew ? "var(--A)" : "var(--B)";
-    return `<div style="background:var(--sf);border:.5px solid var(--bd);border-radius:10px;padding:14px 16px">
-      <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);margin-bottom:6px">${r.segment} Customers</div>
-      <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;color:${clr}">${fmt$(r.net_sales)}</div>
-      <div style="font-size:11px;color:var(--tx3);margin-top:3px">${fmtP(r.pct_revenue)} of revenue &nbsp;·&nbsp; ${fmtN(r.customers)} customers &nbsp;·&nbsp; ${fmtN(r.orders)} orders</div>
-      <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:10px;overflow:hidden">
-        <div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${clr}"></div>
-      </div></div>`;
-  }).join("")}</div>`;
+    const ns    = parseFloat(r.net_sales||0);
+    const estGP = ns * overallMargin;
+    const gpPct = overallMargin * 100;
+    const pctNS = ((ns/totalNVR_NS)*100).toFixed(1);
+    const pctGP = ((estGP/totalNVR_GP)*100).toFixed(1);
+    return `<div class="nvr-card">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px">
+        <!-- Net Sales side -->
+        <div style="flex:1">
+          <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);margin-bottom:6px">${r.segment} Customers — Net Sales</div>
+          <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;color:${clr}">${fmt$(ns)}</div>
+          <div style="font-size:11px;color:var(--tx3);margin-top:3px">${fmtP(r.pct_revenue)} of revenue &nbsp;·&nbsp; ${fmtN(r.customers)} customers &nbsp;·&nbsp; ${fmtN(r.orders)} orders</div>
+          <div style="height:3px;background:var(--bd2);border-radius:2px;margin-top:10px;overflow:hidden">
+            <div style="height:100%;border-radius:2px;width:${Math.min(parseFloat(r.pct_revenue||0),100)}%;background:${clr}"></div>
+          </div>
+        </div>
+        <!-- Gross Profit side -->
+        <div style="flex:1;padding-left:14px;border-left:1px solid var(--bd)">
+          <div style="font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);margin-bottom:6px">${r.segment} Customers — Gross Profit</div>
+          <div style="font-family:'Syne',sans-serif;font-size:22px;font-weight:700;color:var(--A)">${fmt$(estGP)}</div>
+          <div style="font-size:11px;color:var(--tx3);margin-top:3px">${gpPct.toFixed(1)}% GP margin &nbsp;·&nbsp; ${pctGP}% of total GP</div>
+          <div class="nvr-gp-badge" style="margin-top:8px">
+            <svg width="8" height="8" viewBox="0 0 8 8" fill="none"><circle cx="4" cy="4" r="3" fill="var(--A)" opacity=".5"/></svg>
+            est. from overall ${gpPct.toFixed(1)}% margin
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }).join("")}</div>
+  <div style="font-size:10px;color:var(--tx3);margin-top:6px;padding:0 2px">
+    ℹ️ Gross Profit for New/Returning is estimated using the overall GP margin (${(overallMargin*100).toFixed(1)}%) — exact NVR GP requires order-level cost data in Shopify.
+  </div>`;
 }
 
 // ── CUSTOMERS TABLE ───────────────────────────────────────────────
@@ -865,12 +907,9 @@ function renderCustomers(rows, allProducts){
 }
 
 // ── TAIL (WORST 500) ──────────────────────────────────────────────
-// allRows = full GP-sorted product list. Tail = everything after top sellers,
-// i.e. Zone B + Zone C, shown worst-first (reversed).
-let _tailRows = [];  // module-level cache of the current tail dataset
+let _tailRows = [];
 
 function computeTail(allRows) {
-  // Recalculate zones correctly from the full GP-sorted list
   const totalGP = allRows.reduce((a,r)=>a+parseFloat(r.gross_profit||0),0)||1;
   let cumGP = 0;
   const withZone = allRows.map(r => {
@@ -878,7 +917,6 @@ function computeTail(allRows) {
     const pct = (cumGP/totalGP)*100;
     return { ...r, _dynZone: pct <= 80 ? "A" : pct <= 95 ? "B" : "C" };
   });
-  // Keep only B and C — these are the tail
   return withZone.filter(r => r._dynZone !== "A");
 }
 
@@ -895,7 +933,6 @@ function renderTailSummary(tail, allRows) {
   const negGP      = tail.filter(r=>parseFloat(r.gross_profit||0)<0).length;
   const singleUnit = tail.filter(r=>parseInt(r.units||0)<=1).length;
 
-  // Category breakdown of tail
   const byCat = {};
   tail.forEach(r => {
     const c = catLabel(getCategory(r.product_type||""));
@@ -956,7 +993,6 @@ function applyTailFilter() {
   if(catF)  rows = rows.filter(r => getCategory(r.product_type||"") === catF);
   if(zoneF) rows = rows.filter(r => r._dynZone === zoneF);
 
-  // Sort
   if(sortF === "gp_asc")     rows.sort((a,b) => parseFloat(a.gross_profit||0) - parseFloat(b.gross_profit||0));
   if(sortF === "ns_asc")     rows.sort((a,b) => parseFloat(a.net_sales||0)    - parseFloat(b.net_sales||0));
   if(sortF === "units_asc")  rows.sort((a,b) => parseInt(a.units||0)          - parseInt(b.units||0));
@@ -993,7 +1029,6 @@ function applyTailFilter() {
     const units   = parseInt(r.units||0);
     const gpPct   = parseFloat(r.gp_pct||0);
 
-    // Flag logic — highlight candidates for discontinuation
     const flags = [];
     if(ns === 0)      flags.push(`<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:var(--C-bg);color:var(--C);border:.5px solid var(--C-bd)">$0 sales</span>`);
     if(gp < 0)        flags.push(`<span style="font-size:9px;padding:1px 5px;border-radius:3px;background:var(--C-bg);color:var(--C);border:.5px solid var(--C-bd)">neg GP</span>`);
@@ -1042,16 +1077,15 @@ async function render(){
     fetchTab("pareto_new_vs_ret"),
   ]);
 
-  // All product/category views sorted by GP desc
   const fp   = byPeriodGP(products,   pk);
-  const fc   = byPeriodGP(categories, pk);  // kept for reference but we rebuild below
   const fh   = byPeriodNS(channels,   pk);
   const fcu  = byPeriodNS(customers,  pk);
   const fnvr = byPeriodGP(nvr,        pk);
 
-  // Rebuild categories from product_type field — always fresh and consistent
-  // with the Python pipeline's map_product_type_to_category() v1.3
   const fcFromProducts = buildCatsFromProducts(fp);
+
+  // ✅ Build GP per channel from product rows (pareto_channels tab has no GP)
+  const channelGPMap = buildChannelGPFromProducts(fp);
 
   if(fp[0]?.period_start)
     $("period-info").textContent = `${label} · ${fp[0].period_start} → ${fp[0].period_end}`;
@@ -1061,8 +1095,8 @@ async function render(){
   renderInsight(fp, fh, label);
   renderProducts(fp);
   renderCategories(fcFromProducts);
-  renderChannels(fh);
-  renderNVR(fnvr);
+  renderChannels(fh, channelGPMap);   // ✅ pass channelGPMap
+  renderNVR(fnvr, fp);                 // ✅ pass fp for GP estimation
   renderCustomers(fcu, fp);
   renderTail(fp);
 
